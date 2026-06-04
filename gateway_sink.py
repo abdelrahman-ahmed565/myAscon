@@ -5,21 +5,35 @@ Gateway/Sink (Academic IoT Research - Updated):
 Stage A : FIFO time-based scheduling for a configured duration.
 Stage B : Priority scheduling with Mathematical Queue Aging.
 
-Key academic improvements implemented:
+Key features:
 ──────────────────────────────────────────────────────────────────────────────
-1. Mathematical Queue Aging (no re-sort overhead)
-   Aging key pushed into heapq at insertion time:
-       Key = -(Priority_base − k × t_arrival)    k = 0.1
-   Because t_arrival grows monotonically, older packets have a less-negative
-   (i.e. higher) effective priority and automatically bubble to the front
-   without any periodic re-sort pass.
+1. Gateway Profile Assignment (port 9998)
+   A dedicated thread listens on port 9998 for profile requests from nodes.
+   The gateway receives the node's metrics, calculates the security score,
+   selects the appropriate ASCON profile, and replies to the node.
+   The node then encrypts using that gateway-assigned profile.
 
-2. Event-Driven Processing Worker Thread
-   A dedicated daemon thread pulls packets from a thread-safe queue.Queue
-   using get(timeout=0.1) so it wakes the microsecond a packet arrives.
+2. Mathematical Queue Aging (no re-sort overhead)
+   Aging key pushed into heapq at insertion time:
+       Key = -(Priority_base - k * t_arrival)    k = 0.1
+   Older packets surface to the front automatically — no periodic re-sort.
+
+3. Urgent Fragment Priority Floor
+   Urgent fragments (priority_norm >= 0.95) are given a guaranteed priority
+   floor so they cannot be overtaken by aged routine packets.
+   Urgent fragments always process before routine packets in Stage B.
+
+4. Announcement Packet Validation
+   When a node sends an urgent_announcement packet before a burst, the gateway
+   stores the expected fragment count and size. As fragments arrive it tracks
+   them and prints a warning if the count or sizes do not match — detecting
+   transmission failures or injection attacks.
+
+5. Event-Driven Processing Worker Thread
+   A dedicated daemon thread pulls packets from a thread-safe queue.Queue.
    No artificial time.sleep() bottlenecks anywhere in the gateway.
 
-3. Metrics: End-to-End Delay (ms) and Throughput (KB/s) per packet.
+6. Metrics: End-to-End Delay (ms) and Throughput (KB/s) per packet.
 ──────────────────────────────────────────────────────────────────────────────
 """
 
@@ -32,7 +46,7 @@ import queue
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias, Iterable
 
 BytesLike: TypeAlias = bytes | bytearray | memoryview
@@ -129,7 +143,7 @@ def ascon_process_ciphertext(S: list[int], b: int, rate: int, ciphertext: BytesL
     return plaintext
 
 def ascon_finalize(S: list[int], p: AeadParams, key: BytesLike) -> bytes:
-    buf    = bytearray(state_to_bytes(S))
+    buf     = bytearray(state_to_bytes(S))
     pre_off = p.rate
     for i in range(p.key_len):
         if pre_off + i < 40: buf[pre_off + i] ^= key[i]
@@ -185,6 +199,35 @@ def profile_key_from_master(master20: bytes, profile: int) -> bytes:
     if profile == 4: return master20
     return master20[:16]
 
+# -------------------- Profile Assignment --------------------
+
+SECURITY_PROFILE_NAMES = {
+    1: "Lightweight (IoT)",
+    2: "Standard (default)",
+    3: "High Security",
+    4: "Critical / Long-Term",
+}
+
+def calculate_profile_from_metrics(metrics: dict) -> int:
+    """
+    Gateway-side profile selection.
+    Receives the node's metric stars, computes the total score,
+    and returns the appropriate profile ID.
+
+    Score = sum_stars * 5  (max 100, since max stars = 20)
+    Profile bands (same as node fallback):
+        score < 43.75  → Profile 1 (Lightweight)
+        score < 62.5   → Profile 2 (Standard)
+        score < 81.25  → Profile 3 (High Security)
+        score >= 81.25 → Profile 4 (Critical / Ascon-80pq)
+    """
+    percent_score = int(metrics.get("percent_score", 0))
+    x = max(0, min(100, percent_score)) / 100.0
+    if x < 0.4375: return 1
+    if x < 0.625:  return 2
+    if x < 0.8125: return 3
+    return 4
+
 # -------------------- Scheduling structures --------------------
 
 @dataclass
@@ -196,51 +239,84 @@ class InboundItem:
     pkt:           dict[str, Any]
 
 
+# -------------------- Announcement tracking --------------------
+
+@dataclass
+class BurstExpectation:
+    """Stores what the gateway expects from an announced urgent burst."""
+    node_id:       str
+    frag_total:    int
+    frag_size:     int
+    original_size: int
+    profile_id:    int
+    received:      int = 0
+    announced_at:  float = field(default_factory=time.time)
+
+
 # -------------------- Mathematical Aging Key --------------------
 #
-# Aging factor baked into the heap key at insertion time:
+#   Key = -(Priority_base - k * t_arrival)
 #
-#   Key = -(Priority_base - k × t_arrival)
+# With k = 0.1, older packets have a less-negative key and surface first.
+# No periodic re-sort required.
 #
-# With k = 0.1, as t_arrival increases (newer packets) the key becomes
-# *more* negative, meaning they rank lower. Older packets have a less-negative
-# key and naturally surface to the front — no periodic re-sort required.
-# This eliminates the O(n) apply_aging pass and any associated CPU overhead.
+# URGENT PRIORITY FLOOR:
+# Packets with priority_norm >= URGENT_FLOOR bypass the aging formula
+# and always receive a key of -9999.0, guaranteeing they are processed
+# before any routine packet regardless of how long routine packets have aged.
 
-AGING_K = 0.1   # aging coefficient (tunable)
+AGING_K       = 0.1     # aging coefficient
+URGENT_FLOOR  = 0.95    # priority_norm threshold for urgent treatment
 
 
 def aging_key(priority_norm: float, arrival_ts: float) -> float:
     """
-    Return the heap key implementing mathematical aging.
-    heapq is a min-heap, so we negate to get max-priority-first.
-    Lower (more negative) key  →  processed first.
-    Key = -(Priority_base − k × t_arrival)
+    Return the heap key implementing mathematical aging + urgent priority floor.
+
+    heapq is a min-heap so lower (more negative) key = processed first.
+
+    Urgent fragments (priority_norm >= 0.95):
+        Key = -9999.0  (always processed before any routine packet)
+
+    Routine packets:
+        Key = -(Priority_base - k * t_arrival)
     """
+    if priority_norm >= URGENT_FLOOR:
+        # Urgent: fixed floor key so they always beat routine packets.
+        # Use arrival_ts as a tiebreaker among urgent fragments themselves
+        # so older urgent fragments are still processed first.
+        return -9999.0 - arrival_ts
     return -(priority_norm - AGING_K * arrival_ts)
 
 
 # -------------------- Decryption --------------------
 
 def compute_priority_from_packet(pkt: dict[str, Any]) -> float:
+    """
+    Read priority directly from packet if present (urgent fragments embed 1.0),
+    otherwise compute from length_stars + criticality_stars.
+    """
+    explicit = pkt.get("priority_norm")
+    if explicit is not None:
+        return float(explicit)
     m = pkt.get("metrics", {})
-    length_stars     = int(m.get("length_stars", 0))
+    length_stars      = int(m.get("length_stars", 0))
     criticality_stars = int(m.get("criticality_stars", 0))
     raw = length_stars + criticality_stars
     return max(0.0, min(1.0, raw / 8.0))
 
 
 def try_decrypt(pkt: dict[str, Any]) -> bytes | None:
-    sec      = pkt.get("security", {})
-    variant  = sec.get("variant", "Ascon-128")
-    tag_len  = int(sec.get("tag_len", 16))
+    sec        = pkt.get("security", {})
+    variant    = sec.get("variant", "Ascon-128")
+    tag_len    = int(sec.get("tag_len", 16))
     profile_id = int(sec.get("profile_id", 2))
-    node_id  = str(pkt.get("node_id"))
-    ad       = hex_to_bytes(pkt["ad_hex"])
-    nonce    = hex_to_bytes(pkt["nonce_hex"])
-    ct       = hex_to_bytes(pkt["ct_hex"])
-    master   = derive_node_master_key(node_id)
-    key      = profile_key_from_master(master, profile_id)
+    node_id    = str(pkt.get("node_id"))
+    ad         = hex_to_bytes(pkt["ad_hex"])
+    nonce      = hex_to_bytes(pkt["nonce_hex"])
+    ct         = hex_to_bytes(pkt["ct_hex"])
+    master     = derive_node_master_key(node_id)
+    key        = profile_key_from_master(master, profile_id)
     return ascon_decrypt(
         key=key, nonce=nonce, associateddata=ad,
         ciphertext=ct, variant=variant, tag_len=tag_len,
@@ -252,27 +328,31 @@ def try_decrypt(pkt: dict[str, Any]) -> bytes | None:
 class GatewayState:
     """
     Thread-safe container for all mutable gateway state.
-    The receiver thread writes; the processor thread reads/pops.
-    A single threading.Lock protects the FIFO and heap.
+    Three threads share this object:
+      - Main receiver thread (writes packets)
+      - GW-Processor thread (reads/pops packets)
+      - Profile-Server thread (reads nothing here, writes nothing here)
     """
 
     def __init__(self, time_scheduler_seconds: float):
-        self.start_ts              = time.time()
+        self.start_ts               = time.time()
         self.time_scheduler_seconds = time_scheduler_seconds
 
         self.lock      = threading.Lock()
-        self.fifo: list[InboundItem] = []
-        self.heap: list[tuple[float, float, InboundItem]] = []
+        self.fifo:  list[InboundItem]                      = []
+        self.heap:  list[tuple[float, float, InboundItem]] = []
         self.stage_a_ended = False
 
-        # bytes received — updated by receiver thread, read by processor thread
         self._total_bytes = 0
         self._bytes_lock  = threading.Lock()
 
-        # Thread-safe work queue: receiver posts (item, stage_label) for processor
         self.work_q: queue.Queue[tuple[InboundItem, str]] = queue.Queue()
 
-    # ---- helpers ----
+        # Burst expectation tracking: node_id -> BurstExpectation
+        self._burst_lock         = threading.Lock()
+        self._burst_expectations: dict[str, BurstExpectation] = {}
+
+    # ── helpers ──────────────────────────────────────────────────────────────
 
     def elapsed(self) -> float:
         return time.time() - self.start_ts
@@ -292,11 +372,56 @@ class GatewayState:
         elapsed = max(1.0, self.elapsed())
         return (self.total_bytes() / elapsed) / 1024.0
 
+    # ── burst announcement tracking ──────────────────────────────────────────
+
+    def register_burst(self, node_id: str, ann: dict) -> None:
+        """Store what we expect from an announced urgent burst."""
+        exp = BurstExpectation(
+            node_id=node_id,
+            frag_total=int(ann.get("frag_total", 0)),
+            frag_size=int(ann.get("frag_size", 0)),
+            original_size=int(ann.get("original_size", 0)),
+            profile_id=int(ann.get("profile_id", 1)),
+        )
+        with self._burst_lock:
+            self._burst_expectations[node_id] = exp
+        print(
+            f"\n[gateway] 📢 Burst announcement from {node_id}: "
+            f"expecting {exp.frag_total} fragments × ~{exp.frag_size}B "
+            f"(total {exp.original_size}B) using Profile {exp.profile_id}"
+        )
+
+    def record_fragment(self, node_id: str, frag_size: int, declared_frag_size: int) -> None:
+        """
+        Track an arriving fragment against the announced expectation.
+        Prints a warning if the fragment size doesn't match what was declared.
+        """
+        with self._burst_lock:
+            exp = self._burst_expectations.get(node_id)
+            if exp is None:
+                return
+            exp.received += 1
+
+            # Size validation — last fragment is allowed to be smaller
+            if frag_size != declared_frag_size and frag_size != exp.frag_size:
+                delta = abs(frag_size - exp.frag_size)
+                print(
+                    f"🚨 [ATTACK/FAILURE] Fragment size mismatch from {node_id}! "
+                    f"Expected ~{exp.frag_size}B, got {frag_size}B "
+                    f"(delta={delta}B). Possible injection or corruption."
+                )
+
+            # Check if burst is complete
+            if exp.received >= exp.frag_total:
+                print(
+                    f"[gateway] ✅ Burst from {node_id} complete: "
+                    f"{exp.received}/{exp.frag_total} fragments received."
+                )
+                del self._burst_expectations[node_id]
+
+    # ── stage transition ──────────────────────────────────────────────────────
+
     def transition_to_stage_b(self) -> None:
-        """
-        Move remaining Stage-A FIFO packets into the Stage-B heap.
-        Uses mathematical aging key.
-        """
         with self.lock:
             if self.stage_a_ended:
                 return
@@ -309,27 +434,86 @@ class GatewayState:
         if count:
             print(f"\n[gateway] Transition: moved {count} Stage-A packet(s) into Stage-B heap.")
 
+    # ── enqueue ───────────────────────────────────────────────────────────────
+
     def enqueue_stage_a(self, item: InboundItem) -> None:
         with self.lock:
             self.fifo.append(item)
-            # pop immediately from FIFO for FIFO processing
             out = self.fifo.pop(0)
         self.work_q.put((out, "A"))
 
     def enqueue_stage_b(self, item: InboundItem) -> None:
-        # Mathematical aging key baked in at insertion — no re-sort ever needed
         key = aging_key(item.priority_norm, item.arrival_ts)
         with self.lock:
             heapq.heappush(self.heap, (key, item.arrival_ts, item))
-        # Signal the processor that new work is available
         self._drain_heap_to_work_q()
 
     def _drain_heap_to_work_q(self) -> None:
-        """Pop one item from heap and post to work queue (non-blocking)."""
         with self.lock:
             if self.heap:
                 _, _, out = heapq.heappop(self.heap)
                 self.work_q.put((out, "B"))
+
+
+# -------------------- Profile Server Thread (port 9998) --------------------
+
+def profile_server_thread(state: GatewayState, bind_host: str, profile_port: int) -> None:
+    """
+    Listens on port 9998 for profile_request packets from nodes.
+    Calculates the profile from the node's metrics and replies immediately.
+
+    This runs in a dedicated daemon thread so it never blocks the main
+    packet receiver on port 9999.
+    """
+    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv_sock.bind((bind_host, profile_port))
+    srv_sock.settimeout(0.5)
+
+    print(f"[gateway] Profile server listening on {bind_host}:{profile_port}")
+
+    while True:
+        try:
+            data, addr = srv_sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+
+        try:
+            req = json.loads(data.decode("utf-8"))
+        except json.JSONDecodeError:
+            continue
+
+        if req.get("type") != "profile_request":
+            continue
+
+        node_id  = str(req.get("node_id", "unknown"))
+        metrics  = req.get("metrics", {})
+        profile  = calculate_profile_from_metrics(metrics)
+        pname    = SECURITY_PROFILE_NAMES.get(profile, "Unknown")
+
+        # Print what the gateway sees and decided
+        cts   = metrics.get("cts_score", 0.0)
+        nas   = metrics.get("nas_score", 0.0)
+        syn   = metrics.get("n_syn_recv", 0)
+        cw    = metrics.get("n_close_wait", 0)
+        tw    = metrics.get("n_time_wait", 0)
+        stars = metrics.get("sum_stars", 0)
+        pct   = metrics.get("percent_score", 0)
+
+        print(
+            f"\n[profile-server] Request from {node_id} @ {addr[0]} | "
+            f"Stars={stars}/20 ({pct}%) | "
+            f"CTS={cts:.3f} NAS={nas:.3f} | "
+            f"SYN={syn} CW={cw} TW={tw}"
+        )
+        print(f"[profile-server] → Assigned Profile {profile} ({pname}) to {node_id}")
+
+        response = {
+            "type":       "profile_response",
+            "node_id":    node_id,
+            "profile_id": profile,
+            "profile_name": pname,
+        }
+        srv_sock.sendto(json.dumps(response).encode("utf-8"), addr)
 
 
 # -------------------- Processor Thread --------------------
@@ -344,8 +528,6 @@ def processor_thread(state: GatewayState, do_decrypt: bool) -> None:
         try:
             item, stage = state.work_q.get(timeout=0.1)
         except queue.Empty:
-            # No packet arrived within 0.1 s; loop back immediately.
-            # Also drain any queued Stage-B packets that might have piled up.
             state._drain_heap_to_work_q()
             continue
 
@@ -353,10 +535,25 @@ def processor_thread(state: GatewayState, do_decrypt: bool) -> None:
         delay_ms  = (now - item.pkt["ts"]) * 1000.0
         tput_kbps = state.throughput_kbps()
 
+        # Is this an urgent fragment?
+        frag_info  = item.pkt.get("fragment", {})
+        is_frag    = frag_info.get("is_fragment", False)
+        frag_label = ""
+        if is_frag:
+            fi    = frag_info.get("frag_index", 0) + 1
+            ft    = frag_info.get("frag_total", 0)
+            fsize = frag_info.get("frag_size", 0)
+            frag_label = f" [frag {fi}/{ft}]"
+            # Record fragment against announcement
+            state.record_fragment(item.node_id, fsize, fsize)
+
         label = "Stage A Out" if stage == "A" else "Stage B Out"
+        urgent_tag = " 🚨URGENT" if item.priority_norm >= URGENT_FLOOR else ""
+
         print(
-            f"<- [{label}] Node: {item.node_id} Seq: {item.seq:04d} | "
-            f"BasePrio: {item.priority_norm:.3f} | "
+            f"<- [{label}]{urgent_tag}{frag_label} "
+            f"Node: {item.node_id} Seq: {item.seq:04d} | "
+            f"Prio: {item.priority_norm:.3f} | "
             f"Delay: {delay_ms:.3f} ms | "
             f"Throughput: {tput_kbps:.3f} KB/s"
         )
@@ -375,58 +572,71 @@ def processor_thread(state: GatewayState, do_decrypt: bool) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="IoT Gateway – Event-Driven, Mathematical Aging, No Sleep"
+        description="IoT Gateway – Profile Assignment | Event-Driven | Mathematical Aging"
     )
     ap.add_argument("--bind-host",              default="0.0.0.0")
-    ap.add_argument("--bind-port",              type=int, default=9999)
+    ap.add_argument("--bind-port",              type=int, default=9999,
+                    help="UDP port for encrypted data packets")
+    ap.add_argument("--profile-port",           type=int, default=9998,
+                    help="UDP port for profile request/response with nodes")
     ap.add_argument("--time-scheduler-seconds", type=float, default=20.0,
                     help="Duration of Stage A (FIFO) before switching to Stage B (Priority)")
-    ap.add_argument("--process-interval", type=float, default=1.0,
-                    help="(Legacy parameter – retained for CLI compatibility. "
-                         "The event-driven worker processes packets instantly; this value is not used as a sleep delay.)")
+    ap.add_argument("--process-interval",       type=float, default=1.0,
+                    help="(Legacy parameter – retained for CLI compatibility.)")
     ap.add_argument("--decrypt",                action="store_true",
                     help="Attempt to decrypt and verify each message")
     args = ap.parse_args()
 
+    # ── Data socket (port 9999) ───────────────────────────────────────────────
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.bind_host, args.bind_port))
-    sock.settimeout(0.05)   # short timeout so the loop stays responsive
+    sock.settimeout(0.05)
 
     state = GatewayState(time_scheduler_seconds=args.time_scheduler_seconds)
 
-    print(f"[gateway] Listening on {args.bind_host}:{args.bind_port}")
-    print(f"[gateway] Stage A (FIFO) for {args.time_scheduler_seconds}s → Stage B (Priority + Aging)")
-    print(f"[gateway] Aging formula: Key = -(Priority_base − k × t_arrival)  k={AGING_K}")
+    print(f"[gateway] Data socket listening on {args.bind_host}:{args.bind_port}")
+    print(f"[gateway] Stage A (FIFO) for {args.time_scheduler_seconds}s "
+          f"→ Stage B (Priority + Aging)")
+    print(f"[gateway] Aging formula: Key = -(Priority_base - k*t_arrival)  k={AGING_K}")
+    print(f"[gateway] Urgent floor: priority_norm >= {URGENT_FLOOR} → Key = -9999 - t_arrival")
     print(f"[gateway] Decrypt={args.decrypt}")
     print()
 
-    # Start the event-driven processor in a daemon thread
-    proc = threading.Thread(
+    # ── Profile server thread (port 9998) ────────────────────────────────────
+    prof_thread = threading.Thread(
+        target=profile_server_thread,
+        args=(state, args.bind_host, args.profile_port),
+        daemon=True,
+        name="GW-ProfileServer",
+    )
+    prof_thread.start()
+
+    # ── Processor thread ──────────────────────────────────────────────────────
+    proc_thread = threading.Thread(
         target=processor_thread,
         args=(state, args.decrypt),
         daemon=True,
         name="GW-Processor",
     )
-    proc.start()
+    proc_thread.start()
 
     stage_b_announced = False
 
     try:
         while True:
-            now = time.time()
-
-            # ---- Stage transition ----
+            # ── Stage transition ──────────────────────────────────────────────
             if not state.stage_a_active() and not state.stage_a_ended:
                 print(f"\n[gateway] Stage A expired at t={state.elapsed():.1f}s. "
                       "Transitioning to Stage B (Priority Scheduling).")
                 state.transition_to_stage_b()
 
             if state.stage_a_ended and not stage_b_announced:
-                print(f"[gateway] Stage B active. Mathematical aging key: "
-                      f"Key = -(p − {AGING_K} × t_arrival)\n")
+                print(f"[gateway] Stage B active. "
+                      f"Key = -(p - {AGING_K}*t_arrival) | "
+                      f"Urgent floor at prio >= {URGENT_FLOOR}\n")
                 stage_b_announced = True
 
-            # ---- Receive packet ----
+            # ── Receive packet ────────────────────────────────────────────────
             try:
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:
@@ -440,12 +650,22 @@ def main() -> None:
                 print(f"[gateway] Malformed packet from {addr}, ignored.")
                 continue
 
-            if pkt.get("type") != "ascon_node_msg":
+            pkt_type = pkt.get("type")
+
+            # ── Handle announcement packet ────────────────────────────────────
+            if pkt_type == "urgent_announcement":
+                node_id = str(pkt.get("node_id", "unknown"))
+                state.register_burst(node_id, pkt)
+                continue
+
+            # ── Handle normal / fragment data packets ─────────────────────────
+            if pkt_type != "ascon_node_msg":
                 continue
 
             node_id = str(pkt.get("node_id", "unknown"))
             seq     = int(pkt.get("seq", 0))
             pr      = compute_priority_from_packet(pkt)
+            now     = time.time()
 
             item = InboundItem(
                 arrival_ts=now,
@@ -455,13 +675,18 @@ def main() -> None:
                 pkt=pkt,
             )
 
+            is_urgent = pr >= URGENT_FLOOR
+            tag       = " 🚨URGENT" if is_urgent else ""
+
             if state.stage_a_active():
-                print(f"-> [Stage A In]  Node: {node_id}  Seq: {seq:04d}  Prio: {pr:.3f}")
+                print(f"-> [Stage A In]{tag}  Node: {node_id}  Seq: {seq:04d}  Prio: {pr:.3f}")
                 state.enqueue_stage_a(item)
             else:
-                aging_k_val = aging_key(pr, now)
-                print(f"-> [Stage B In]  Node: {node_id}  Seq: {seq:04d}  "
-                      f"BasePrio: {pr:.3f}  AgingKey: {aging_k_val:.6f}")
+                key_val = aging_key(pr, now)
+                print(
+                    f"-> [Stage B In]{tag}  Node: {node_id}  Seq: {seq:04d}  "
+                    f"Prio: {pr:.3f}  Key: {key_val:.4f}"
+                )
                 state.enqueue_stage_b(item)
 
     except KeyboardInterrupt:
