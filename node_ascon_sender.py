@@ -785,6 +785,32 @@ def fragment_payload(payload: bytes, fragment_size: int) -> list[bytes]:
 
 # -------------------- Duty-Cycle Send Helpers --------------------
 
+def _routine_sleep(payload_len: int) -> None:
+    """
+    Sleep duration depends on payload size.
+    Small payloads simulate real IoT sense→send→sleep duty cycle.
+    Large payloads send immediately — no point sleeping for big data.
+
+        0   –  64 bytes  (Short)    : sleep 2–3 seconds
+        65  – 254 bytes  (Normal)   : sleep 1–2 seconds
+        255 – 1024 bytes (Long)     : sleep 0.5 seconds
+        1025+ bytes      (Very Long): no sleep
+    """
+    if payload_len <= 64:
+        sleep_s = random.uniform(2.0, 3.0)
+        print(f"  [ROUTINE] Short payload — sleeping {sleep_s:.2f}s (duty cycle)...\n")
+        time.sleep(sleep_s)
+    elif payload_len <= 254:
+        sleep_s = random.uniform(1.0, 2.0)
+        print(f"  [ROUTINE] Normal payload — sleeping {sleep_s:.2f}s (duty cycle)...\n")
+        time.sleep(sleep_s)
+    elif payload_len <= 1024:
+        print(f"  [ROUTINE] Long payload — sleeping 0.5s (duty cycle)...\n")
+        time.sleep(0.5)
+    else:
+        print(f"  [ROUTINE] Very long payload — no sleep, sending immediately.\n")
+
+
 def send_routine_packet(
     sock: socket.socket,
     gateway_addr: tuple[str, int],
@@ -795,17 +821,20 @@ def send_routine_packet(
     associated_data: bytes,
 ) -> int:
     """
-    ROUTINE TRAFFIC MODE — sense → request profile → send → sleep.
-    1. Measure metrics for a ~40B payload.
-    2. Request profile from gateway on port 9998.
-    3. Encrypt and send packet.
-    4. Sleep 2-3 seconds (duty cycle).
+    ROUTINE TRAFFIC MODE — sense → request profile → send → sleep (size-dependent).
+    1. Generate a fully random payload (1-2048 bytes).
+    2. Measure metrics — criticality is random and independent of size.
+    3. Request profile from gateway on port 9998.
+    4. Encrypt and send packet.
+    5. Sleep based on payload size (large payloads = no sleep).
     Returns next sequence number.
     """
-    payload = get_random_bytes(ROUTINE_PAYLOAD_BYTES)
+    # Fully random payload size 1-2048 bytes
+    payload = get_random_bytes(random.randint(1, 2048))
     print(f"[ROUTINE] Node {node_id} | Seq={seq:04d} | Payload={len(payload)}B")
 
-    # Measure metrics first so we can send them to the gateway for profile decision
+    # Measure metrics — criticality is randomly assigned inside compute_metrics()
+    # and is completely independent of payload size
     metrics = compute_metrics(len(payload))
 
     # Gateway decides the profile
@@ -822,9 +851,8 @@ def send_routine_packet(
     )
     seq += 1
 
-    sleep_s = random.uniform(ROUTINE_SLEEP_MIN_S, ROUTINE_SLEEP_MAX_S)
-    print(f"  [ROUTINE] Sleeping {sleep_s:.2f}s (duty cycle)...\n")
-    time.sleep(sleep_s)
+    # Sleep depends on how big the payload was
+    _routine_sleep(len(payload))
     return seq
 
 
@@ -846,7 +874,8 @@ def send_urgent_burst(
     4. Send all fragments immediately (no sleep between them).
     Returns next sequence number after all fragments are sent.
     """
-    full_payload = get_random_bytes(URGENT_PAYLOAD_BYTES)
+    # Fully random payload size 1-2048 bytes for urgent burst
+    full_payload = get_random_bytes(random.randint(1, 2048))
     fragments    = fragment_payload(full_payload, URGENT_FRAGMENT_SIZE)
     total_frags  = len(fragments)
 
@@ -856,8 +885,8 @@ def send_urgent_burst(
     print(f"{'='*60}\n")
 
     # ── Step 1: measure metrics ONCE for the whole burst ──────────────────────
-    # Use a representative fragment size for metric calculation
-    metrics = compute_metrics(URGENT_FRAGMENT_SIZE)
+    # Use full payload size for metric calculation
+    metrics = compute_metrics(len(full_payload))
 
     # ── Step 2: request profile from gateway ONCE ─────────────────────────────
     profile  = request_profile_from_gateway(gateway_host, profile_port, node_id, metrics)
@@ -923,9 +952,9 @@ def send_urgent_burst(
             },
             "metrics": {
                 "length_bytes":       len(frag_data),
-                "length_band":        "Short",
-                "length_stars":       4,
-                "criticality":        "Critical",
+                "length_band":        _score_length(len(frag_data))[0],
+                "length_stars":       _score_length(len(frag_data))[1],
+                "criticality":        "Critical",   # urgent events always critical
                 "criticality_stars":  4,
                 "threat":             metrics.threat,
                 "threat_stars":       metrics.threat_stars,
