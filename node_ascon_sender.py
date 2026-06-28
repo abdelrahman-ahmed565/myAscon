@@ -35,6 +35,17 @@ import time
 from dataclasses import dataclass
 from typing import Literal, TypeAlias, Iterable
 
+# -------------------- Terminal Colours --------------------
+def _c(code, text): return f"\033[{code}m{text}\033[0m"
+def CYAN(t):    return _c("96", t)
+def GREEN(t):   return _c("92", t)
+def YELLOW(t):  return _c("93", t)
+def RED(t):     return _c("91", t)
+def BOLD(t):    return _c("1",  t)
+def DIM(t):     return _c("2",  t)
+def MAGENTA(t): return _c("95", t)
+def divider(c="─", w=70): print(DIM(c * w))
+
 # -------------------- pyJoules (optional, not available on ARM) --------------------
 try:
     from pyJoules.energy_meter import EnergyMeter
@@ -204,7 +215,7 @@ def measure_threat_level() -> tuple[ThreatLevel, int, float, float, int, int, in
         conns = psutil.net_connections(kind='inet')
 
         # Print raw psutil output so it is visible in the terminal
-        print(f"  [psutil] Raw connections snapshot: {len(conns)} total sockets")
+        print(f"  {DIM(f'[psutil] {len(conns)} sockets total')}")
         for conn in conns:
             if conn.status == 'SYN_RECV':
                 n_syn_recv += 1
@@ -240,8 +251,13 @@ def measure_threat_level() -> tuple[ThreatLevel, int, float, float, int, int, in
         level, stars = "Extremely High", 4
 
     # ── Terminal print ───────────────────────────────────────────────────────
-    print(f"  [psutil] SYN_RECV={n_syn_recv}  CLOSE_WAIT={n_close_wait}  TIME_WAIT={n_time_wait}")
-    print(f"  [psutil] NAS={nas:.4f}  CTS={cts:.4f}  →  Threat: {level} ({stars}★)")
+    threat_colour = {
+        "Low": GREEN, "Medium": YELLOW,
+        "High": RED,  "Extremely High": lambda t: RED(BOLD(t))
+    }.get(level, str)
+    print(f"  {DIM('[psutil]')} SYN={n_syn_recv} CW={n_close_wait} TW={n_time_wait}  "
+          f"│  NAS={nas:.3f}  CTS={cts:.3f}  "
+          f"│  Threat: {threat_colour(f'{level} ({stars}★)')}")
 
     return level, stars, cts, nas, n_syn_recv, n_close_wait, n_time_wait
 
@@ -609,12 +625,11 @@ def request_profile_from_gateway(
         if resp.get("type") == "profile_response" and resp.get("node_id") == node_id:
             profile_id = int(resp["profile_id"])
             profile_name = SECURITY_PROFILES[profile_id].name
-            print(f"  [profile] Gateway assigned Profile {profile_id} ({profile_name})")
+            print(GREEN(f"  [Profile] ← Gateway assigned Profile {profile_id} ({profile_name})"))
             return profile_id
 
     except (socket.timeout, json.JSONDecodeError, KeyError, ValueError) as e:
-        print(f"  [profile] Gateway unreachable or bad response ({e}). "
-              f"Falling back to local profile selection.")
+        print(YELLOW(f"  [Profile] Gateway unreachable ({e}). Using local fallback."))
     finally:
         req_sock.close()
 
@@ -742,28 +757,34 @@ def build_and_send_packet(
     sec = pkt["security"]
     pr  = pkt["priority_norm"]
 
-    print(
-        f"[Node {node_id}] Seq={seq:04d} | "
-        f"Profile={sec['profile_id']} ({sec['profile_name']}) | "
-        f"Variant={sec['variant']} | "
-        f"Payload={m['length_bytes']}B ({m['length_band']}) | "
-        f"Stars={m['sum_stars']}/20 ({m['percent_score']}%) | "
-        f"Prio={pr:.3f}"
-    )
-    print(
-        f"  Metrics → Length:{m['length_stars']}★ "
-        f"Crit:{m['criticality_stars']}★ ({m['criticality']}) "
-        f"Threat:{m['threat_stars']}★ ({m['threat']}) "
-        f"CTS={m['cts_score']:.3f} "
-        f"CPU:{m['cpu_stars']}★ ({m['cpu_percent']:.1f}%) "
-        f"RAM:{m['ram_stars']}★ ({m['ram_percent']:.1f}%)"
-    )
-    print(
-        f"  ⚡ Energy: P={e['power_w']:.4f}W | "
-        f"Enc={e['enc_time_us']:.2f}µs | "
-        f"E={e['energy_j']:.9f}J ({e['energy_uj']:.4f}µJ)"
-    )
-    print(f"  Wire size: {len(raw)} bytes")
+    lb   = m['length_bytes'];  lband = m['length_band']
+    pid  = sec['profile_id'];   pname = sec['profile_name']
+    var  = sec['variant']
+    ls=m['length_stars']; cs=m['criticality_stars']; crit=m['criticality']
+    ts=m['threat_stars'];  thr=m['threat'];           cts=m['cts_score']
+    cpus=m['cpu_stars'];   cpup=m['cpu_percent']
+    rams=m['ram_stars'];   ramp=m['ram_percent']
+    ss=m['sum_stars'];     pct=m['percent_score']
+
+    divider()
+    print(f"  ▶ {BOLD(CYAN('[NODE ' + node_id + ']'))}  "
+          f"Seq={BOLD(str(seq).zfill(4))}  │  "
+          f"Payload={BOLD(str(lb) + 'B')} ({lband})")
+    print(f"    Profile  : {GREEN('Profile ' + str(pid) + ' — ' + pname)}  "
+          f"│  Variant={var}")
+    print(f"    Metrics  : "
+          f"Length {ls}★  "
+          f"Crit {cs}★ ({crit})  "
+          f"Threat {ts}★ ({thr})  "
+          f"CTS={YELLOW(f'{cts:.3f}')}  "
+          f"CPU {cpus}★ ({cpup:.0f}%)  "
+          f"RAM {rams}★ ({ramp:.0f}%)")
+    print(f"    Score    : {BOLD(str(ss) + '/20')} ({pct}%)  "
+          f"│  Priority={BOLD(f'{pr:.3f}')}")
+    print(f"    ⚡ Energy : P={e['power_w']:.3f}W  │  "
+          f"Enc={e['enc_time_us']:.1f}µs  │  "
+          f"E={e['energy_j']:.9f}J  ({e['energy_uj']:.3f}µJ)")
+    print(f"    Wire size: {len(raw)} bytes")
     print()
 
 
@@ -798,17 +819,17 @@ def _routine_sleep(payload_len: int) -> None:
     """
     if payload_len <= 64:
         sleep_s = random.uniform(2.0, 3.0)
-        print(f"  [ROUTINE] Short payload — sleeping {sleep_s:.2f}s (duty cycle)...\n")
+        print(DIM(f"  💤 Short payload — sleeping {sleep_s:.2f}s (duty cycle)\n"))
         time.sleep(sleep_s)
     elif payload_len <= 254:
         sleep_s = random.uniform(1.0, 2.0)
-        print(f"  [ROUTINE] Normal payload — sleeping {sleep_s:.2f}s (duty cycle)...\n")
+        print(DIM(f"  💤 Normal payload — sleeping {sleep_s:.2f}s (duty cycle)\n"))
         time.sleep(sleep_s)
     elif payload_len <= 1024:
-        print(f"  [ROUTINE] Long payload — sleeping 0.5s (duty cycle)...\n")
+        print(DIM(f"  💤 Long payload — sleeping 0.5s (duty cycle)\n"))
         time.sleep(0.5)
     else:
-        print(f"  [ROUTINE] Very long payload — no sleep, sending immediately.\n")
+        print(DIM(f"  ⚡ Very long payload — sending immediately (no sleep)\n"))
 
 
 def send_routine_packet(
@@ -831,7 +852,8 @@ def send_routine_packet(
     """
     # Fully random payload size 1-2048 bytes
     payload = get_random_bytes(random.randint(1, 2048))
-    print(f"[ROUTINE] Node {node_id} | Seq={seq:04d} | Payload={len(payload)}B")
+    divider("═")
+    print(BOLD(CYAN(f"  [ROUTINE] Node {node_id}  │  Seq={seq:04d}  │  Payload={len(payload)}B")))
 
     # Measure metrics — criticality is randomly assigned inside compute_metrics()
     # and is completely independent of payload size
@@ -879,10 +901,13 @@ def send_urgent_burst(
     fragments    = fragment_payload(full_payload, URGENT_FRAGMENT_SIZE)
     total_frags  = len(fragments)
 
-    print(f"\n{'='*60}")
-    print(f"[URGENT] *** CRITICAL EVENT *** Node {node_id}")
-    print(f"[URGENT] Full payload={len(full_payload)}B → {total_frags} fragments of ~{URGENT_FRAGMENT_SIZE}B")
-    print(f"{'='*60}\n")
+    print(f"\n")
+    divider("═")
+    print(RED(BOLD(f"  🚨 URGENT BURST — CRITICAL EVENT — Node {node_id}")))
+    print(f"     Full payload : {BOLD(str(len(full_payload)))}B  →  "
+          f"{BOLD(str(total_frags))} fragments × ~{URGENT_FRAGMENT_SIZE}B")
+    divider("═")
+    print()
 
     # ── Step 1: measure metrics ONCE for the whole burst ──────────────────────
     # Use full payload size for metric calculation
@@ -895,7 +920,8 @@ def send_urgent_burst(
     master   = derive_node_master_key(node_id)
     key      = profile_key_from_master(master, profile)
 
-    print(f"[URGENT] Gateway assigned Profile {profile} ({sp.name}) for ALL {total_frags} fragments\n")
+    print(GREEN(f"  [URGENT] Gateway assigned Profile {profile} ({sp.name}) "
+                f"for ALL {total_frags} fragments\n"))
 
     # ── Step 3: send announcement packet ──────────────────────────────────────
     # This tells the gateway exactly what to expect so it can validate
@@ -915,8 +941,8 @@ def send_urgent_burst(
     }
     ann_bytes = json.dumps(announcement).encode("utf-8")
     sock.sendto(ann_bytes, gateway_addr)
-    print(f"[URGENT] Announcement sent: {total_frags} fragments coming, "
-          f"original={len(full_payload)}B, profile={profile} ({sp.variant})")
+    print(MAGENTA(f"  📢 Announcement sent → {total_frags} fragments coming, "
+                  f"original={len(full_payload)}B, profile={profile} ({sp.variant})"))
     seq += 1
 
     # ── Step 4: burst-send all fragments ──────────────────────────────────────
@@ -994,19 +1020,20 @@ def send_urgent_burst(
         sock.sendto(raw, gateway_addr)
 
         print(
-            f"  [URGENT frag {frag_idx+1:03d}/{total_frags}] "
-            f"Seq={seq:04d} | {len(frag_data)}B | "
-            f"Prio={URGENT_PRIORITY_HINT:.3f} | "
-            f"Profile={profile} ({sp.name}) | "
-            f"CTS={metrics.cts_score:.3f} | "
-            f"⚡ {energy_j*1e6:.4f}µJ"
+            f"  ▶ {RED(f'Frag {frag_idx+1:03d}/{total_frags}')}  "
+            f"Seq={seq:04d}  │  {len(frag_data)}B  │  "
+            f"Prio={URGENT_PRIORITY_HINT:.1f}  │  "
+            f"Profile={profile}  │  "
+            f"⚡ {energy_j*1e6:.3f}µJ"
         )
         seq += 1
 
         if URGENT_INTER_FRAG_SLEEP > 0:
             time.sleep(URGENT_INTER_FRAG_SLEEP)
 
-    print(f"\n[URGENT] Burst complete. {total_frags} fragments sent.\n")
+    divider()
+    print(GREEN(f"  ✅ Burst complete — {total_frags} fragments sent  "
+                f"│  Total={len(full_payload)}B\n"))
     return seq
 
 
@@ -1039,16 +1066,16 @@ def main() -> None:
     gateway_addr    = (args.gateway_host, args.gateway_port)
     associated_data = args.ad.encode("utf-8")
 
-    print(f"[node] id={args.node_id}  gateway={args.gateway_host}:{args.gateway_port}")
-    print(f"[node] profile-request port={args.profile_port}")
-    print(f"[node] mode={args.length_mode}  count={args.count}  urgent_prob={args.urgent_prob:.0%}")
-    print(f"[node] Routine payload={ROUTINE_PAYLOAD_BYTES}B  sleep={ROUTINE_SLEEP_MIN_S}-{ROUTINE_SLEEP_MAX_S}s")
-    print(f"[node] Urgent payload={URGENT_PAYLOAD_BYTES}B → fragments of {URGENT_FRAGMENT_SIZE}B")
-    print(f"[node] Threat model: NAS=(S+0.5C+0.25T)/{THREAT_NORM}  "
-          f"CTS={THREAT_BASELINE}+{1-THREAT_BASELINE}*NAS")
-    print(f"[node] Energy model: P_idle={IDLE_POWER_W}W  P_max={MAX_POWER_W}W  "
-          f"P=(P_idle + {POWER_RANGE_W}*CPU/100)")
-    print()
+    print(f"\033[96m{'═'*70}\033[0m")
+    print(f"\033[1m\033[96m  IoT SENSOR NODE — STARTING UP\033[0m")
+    print(f"\033[96m{'═'*70}\033[0m")
+    print(f"  Node ID      : {BOLD(args.node_id)}")
+    print(f"  Cluster Head : {BOLD(args.gateway_host)}:{args.gateway_port}")
+    print(f"  Profile port : {BOLD(str(args.profile_port))}")
+    print(f"  Mode         : {BOLD(mode)}")
+    print(f"  Threat model : NAS=(S+0.5C+0.25T)/{THREAT_NORM}  CTS={THREAT_BASELINE}+{1-THREAT_BASELINE}*NAS")
+    print(f"  Energy model : P={IDLE_POWER_W}+{POWER_RANGE_W}*(CPU/100)W  E=P*t")
+    print(f"\033[96m{'─'*70}\033[0m\n")
 
     seq      = 0
     infinite = (args.count == 0)
