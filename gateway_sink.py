@@ -1,40 +1,18 @@
 #!/usr/bin/env python3
 """
-Gateway/Sink (Academic IoT Research - Updated):
+Cluster Head / Gateway (Academic IoT Research)
+===============================================
+Stage A : FIFO scheduling for the first N seconds (default 20s)
+Stage B : Priority scheduling with Mathematical Queue Aging
+           Key = -(Priority_base - 0.1 * t_arrival)
+           Urgent fragments (priority >= 0.95) get Key = -9999 - t_arrival
 
-Stage A : FIFO time-based scheduling for a configured duration.
-Stage B : Priority scheduling with Mathematical Queue Aging.
-
-Key features:
-──────────────────────────────────────────────────────────────────────────────
-1. Gateway Profile Assignment (port 9998)
-   A dedicated thread listens on port 9998 for profile requests from nodes.
-   The gateway receives the node's metrics, calculates the security score,
-   selects the appropriate ASCON profile, and replies to the node.
-   The node then encrypts using that gateway-assigned profile.
-
-2. Mathematical Queue Aging (no re-sort overhead)
-   Aging key pushed into heapq at insertion time:
-       Key = -(Priority_base - k * t_arrival)    k = 0.1
-   Older packets surface to the front automatically — no periodic re-sort.
-
-3. Urgent Fragment Priority Floor
-   Urgent fragments (priority_norm >= 0.95) are given a guaranteed priority
-   floor so they cannot be overtaken by aged routine packets.
-   Urgent fragments always process before routine packets in Stage B.
-
-4. Announcement Packet Validation
-   When a node sends an urgent_announcement packet before a burst, the gateway
-   stores the expected fragment count and size. As fragments arrive it tracks
-   them and prints a warning if the count or sizes do not match — detecting
-   transmission failures or injection attacks.
-
-5. Event-Driven Processing Worker Thread
-   A dedicated daemon thread pulls packets from a thread-safe queue.Queue.
-   No artificial time.sleep() bottlenecks anywhere in the gateway.
-
-6. Metrics: End-to-End Delay (ms) and Throughput (KB/s) per packet.
-──────────────────────────────────────────────────────────────────────────────
+Features:
+  - Profile Assignment Server  (port 9998): assigns ASCON profile to each node
+  - Fragment Reassembly        : rebuilds original data from urgent burst fragments
+  - Transmission Integrity     : validates reassembled size vs announced size
+  - Event-Driven Processing    : zero sleep, wakes instantly on packet arrival
+  - Clear colour-coded terminal output for easy demo presentation
 """
 
 from __future__ import annotations
@@ -49,187 +27,170 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias, Iterable
 
-BytesLike: TypeAlias = bytes | bytearray | memoryview
-AsconAeadVariant: TypeAlias = Literal["Ascon-128", "Ascon-128a", "Ascon-80pq"]
-ProfileId: TypeAlias = Literal[1, 2, 3, 4]
+BytesLike:       TypeAlias = bytes | bytearray | memoryview
+AsconAeadVariant:TypeAlias = Literal["Ascon-128", "Ascon-128a", "Ascon-80pq"]
 
-# -------------------- Ascon AEAD --------------------
+# ═══════════════════════════════════════════════════════════════════
+#  TERMINAL COLOURS  (disable with --no-colour)
+# ═══════════════════════════════════════════════════════════════════
+USE_COLOUR = True
 
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if USE_COLOUR else text
+
+def CYAN(t):   return _c("96", t)
+def GREEN(t):  return _c("92", t)
+def YELLOW(t): return _c("93", t)
+def RED(t):    return _c("91", t)
+def BOLD(t):   return _c("1",  t)
+def DIM(t):    return _c("2",  t)
+def MAGENTA(t):return _c("95", t)
+
+def divider(char="─", width=70):
+    print(DIM(char * width))
+
+def section(title: str):
+    divider("═")
+    print(BOLD(CYAN(f"  {title}")))
+    divider("═")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ASCON AEAD
+# ═══════════════════════════════════════════════════════════════════
 @dataclass(frozen=True)
 class AeadParams:
-    key_len: int
-    nonce_len: int
-    rate: int
-    a: int
-    b: int
-    tag_len: int
-    iv: bytes
+    key_len: int; nonce_len: int; rate: int
+    a: int;      b: int;         tag_len: int; iv: bytes
 
 AEAD_PARAMS: dict[AsconAeadVariant, AeadParams] = {
-    "Ascon-128":  AeadParams(16, 16, 8,  12, 6, 16, bytes.fromhex("80400c0600000000")),
-    "Ascon-128a": AeadParams(16, 16, 16, 12, 8, 16, bytes.fromhex("80800c0800000000")),
-    "Ascon-80pq": AeadParams(20, 16, 8,  12, 6, 16, bytes.fromhex("a0400c06")),
+    "Ascon-128":  AeadParams(16,16, 8,12, 6,16, bytes.fromhex("80400c0600000000")),
+    "Ascon-128a": AeadParams(16,16,16,12, 8,16, bytes.fromhex("80800c0800000000")),
+    "Ascon-80pq": AeadParams(20,16, 8,12, 6,16, bytes.fromhex("a0400c06")),
 }
 
-def ascon_decrypt(
-    key: BytesLike, nonce: BytesLike, associateddata: BytesLike,
-    ciphertext: BytesLike, variant: AsconAeadVariant = "Ascon-128",
-    tag_len: int | None = None,
-) -> bytes | None:
-    p = AEAD_PARAMS[variant]
-    if tag_len is None: tag_len = p.tag_len
-    assert len(key) == p.key_len and len(nonce) == p.nonce_len
-    assert 0 < tag_len <= 16 and len(ciphertext) >= tag_len
-    ct, tag = ciphertext[:-tag_len], ciphertext[-tag_len:]
-    S = [0, 0, 0, 0, 0]
-    ascon_initialize(S, p, key, nonce)
-    ascon_process_associated_data(S, p.b, p.rate, associateddata)
-    plaintext = ascon_process_ciphertext(S, p.b, p.rate, ct)
-    full_tag = ascon_finalize(S, p, key)
-    if full_tag[:tag_len] == tag: return plaintext
-    return None
+def ascon_decrypt(key,nonce,ad,ct,variant="Ascon-128",tag_len=None):
+    p=AEAD_PARAMS[variant]
+    if tag_len is None: tag_len=p.tag_len
+    assert len(key)==p.key_len and len(nonce)==p.nonce_len
+    assert 0<tag_len<=16 and len(ct)>=tag_len
+    body,tag=ct[:-tag_len],ct[-tag_len:]
+    S=[0,0,0,0,0]
+    _init(S,p,key,nonce); _process_ad(S,p.b,p.rate,ad)
+    pt=_process_ct(S,p.b,p.rate,body); full_tag=_finalize(S,p,key)
+    return pt if full_tag[:tag_len]==tag else None
 
-def ascon_initialize(S: list[int], p: AeadParams, key: BytesLike, nonce: BytesLike) -> None:
-    iv_len = 24 - p.key_len
-    assert len(p.iv) == iv_len
-    init = p.iv + to_bytes(key) + to_bytes(nonce)
-    S[0], S[1], S[2], S[3], S[4] = bytes_to_state(init)
-    ascon_permutation(S, p.a)
-    buf = bytearray(state_to_bytes(S))
-    off = 40 - p.key_len
-    for i in range(p.key_len): buf[off + i] ^= key[i]
-    S[0], S[1], S[2], S[3], S[4] = bytes_to_state(bytes(buf))
+def _init(S,p,key,nonce):
+    iv_len=24-p.key_len
+    init=p.iv+bytes(key)+bytes(nonce)
+    S[0],S[1],S[2],S[3],S[4]=_b2s(init); _perm(S,p.a)
+    buf=bytearray(_s2b(S)); off=40-p.key_len
+    for i in range(p.key_len): buf[off+i]^=key[i]
+    S[0],S[1],S[2],S[3],S[4]=_b2s(bytes(buf))
 
-def ascon_process_associated_data(S: list[int], b: int, rate: int, associateddata: BytesLike) -> None:
-    if len(associateddata) > 0:
-        a_padding = to_bytes([0x01]) + zero_bytes(rate - (len(associateddata) % rate) - 1)
-        a_padded  = to_bytes(associateddata) + a_padding
-        for block in range(0, len(a_padded), rate):
-            S[0] ^= bytes_to_int(a_padded[block:block + 8])
-            if rate == 16: S[1] ^= bytes_to_int(a_padded[block + 8:block + 16])
-            ascon_permutation(S, b)
-    S[4] ^= 1 << 63
+def _process_ad(S,b,rate,ad):
+    if len(ad)>0:
+        pad=bytes([0x01])+b"\x00"*(rate-(len(ad)%rate)-1)
+        padded=bytes(ad)+pad
+        for i in range(0,len(padded),rate):
+            S[0]^=_b2i(padded[i:i+8])
+            if rate==16: S[1]^=_b2i(padded[i+8:i+16])
+            _perm(S,b)
+    S[4]^=1<<63
 
-def ascon_process_ciphertext(S: list[int], b: int, rate: int, ciphertext: BytesLike) -> bytes:
-    c_lastlen = len(ciphertext) % rate
-    c_padded  = to_bytes(ciphertext) + zero_bytes(rate - c_lastlen)
-    plaintext = b""
-    for block in range(0, len(c_padded) - rate, rate):
-        c0 = bytes_to_int(c_padded[block:block + 8])
-        if rate == 16:
-            c1 = bytes_to_int(c_padded[block + 8:block + 16])
-            plaintext += int_to_bytes(S[0] ^ c0, 8) + int_to_bytes(S[1] ^ c1, 8)
-            S[0], S[1] = c0, c1
+def _process_ct(S,b,rate,ct):
+    lastlen=len(ct)%rate
+    padded=bytes(ct)+b"\x00"*(rate-lastlen)
+    pt=b""
+    for i in range(0,len(padded)-rate,rate):
+        c0=_b2i(padded[i:i+8])
+        if rate==16:
+            c1=_b2i(padded[i+8:i+16])
+            pt+=_i2b(S[0]^c0,8)+_i2b(S[1]^c1,8); S[0],S[1]=c0,c1
         else:
-            plaintext += int_to_bytes(S[0] ^ c0, 8)
-            S[0] = c0
-        ascon_permutation(S, b)
-    block = len(c_padded) - rate
-    c0    = bytes_to_int(c_padded[block:block + 8])
-    if rate == 16:
-        c1  = bytes_to_int(c_padded[block + 8:block + 16])
-        out = (int_to_bytes(S[0] ^ c0, 8) + int_to_bytes(S[1] ^ c1, 8))[:c_lastlen]
-        plaintext += out
-        c_padx = zero_bytes(c_lastlen) + to_bytes([0x01]) + zero_bytes(rate - c_lastlen - 1)
-        c_mask = zero_bytes(c_lastlen) + ff_bytes(rate - c_lastlen)
-        S[0] = (S[0] & bytes_to_int(c_mask[0:8])) ^ c0 ^ bytes_to_int(c_padx[0:8])
-        S[1] = (S[1] & bytes_to_int(c_mask[8:16])) ^ c1 ^ bytes_to_int(c_padx[8:16])
+            pt+=_i2b(S[0]^c0,8); S[0]=c0
+        _perm(S,b)
+    i=len(padded)-rate; c0=_b2i(padded[i:i+8])
+    if rate==16:
+        c1=_b2i(padded[i+8:i+16])
+        out=((_i2b(S[0]^c0,8)+_i2b(S[1]^c1,8)))[:lastlen]; pt+=out
+        px=b"\x00"*lastlen+bytes([0x01])+b"\x00"*(rate-lastlen-1)
+        mx=b"\x00"*lastlen+b"\xFF"*(rate-lastlen)
+        S[0]=(S[0]&_b2i(mx[0:8]))^c0^_b2i(px[0:8])
+        S[1]=(S[1]&_b2i(mx[8:16]))^c1^_b2i(px[8:16])
     else:
-        out = int_to_bytes(S[0] ^ c0, 8)[:c_lastlen]
-        plaintext += out
-        c_padx = zero_bytes(c_lastlen) + to_bytes([0x01]) + zero_bytes(rate - c_lastlen - 1)
-        c_mask = zero_bytes(c_lastlen) + ff_bytes(rate - c_lastlen)
-        S[0] = (S[0] & bytes_to_int(c_mask[0:8])) ^ c0 ^ bytes_to_int(c_padx[0:8])
-    return plaintext
+        out=_i2b(S[0]^c0,8)[:lastlen]; pt+=out
+        px=b"\x00"*lastlen+bytes([0x01])+b"\x00"*(rate-lastlen-1)
+        mx=b"\x00"*lastlen+b"\xFF"*(rate-lastlen)
+        S[0]=(S[0]&_b2i(mx[0:8]))^c0^_b2i(px[0:8])
+    return pt
 
-def ascon_finalize(S: list[int], p: AeadParams, key: BytesLike) -> bytes:
-    buf     = bytearray(state_to_bytes(S))
-    pre_off = p.rate
+def _finalize(S,p,key):
+    buf=bytearray(_s2b(S))
     for i in range(p.key_len):
-        if pre_off + i < 40: buf[pre_off + i] ^= key[i]
-    S[0], S[1], S[2], S[3], S[4] = bytes_to_state(bytes(buf))
-    ascon_permutation(S, p.a)
-    buf      = bytearray(state_to_bytes(S))
-    post_off = 40 - p.key_len
-    for i in range(p.key_len): buf[post_off + i] ^= key[i]
-    S[0], S[1], S[2], S[3], S[4] = bytes_to_state(bytes(buf))
-    return int_to_bytes(S[3], 8) + int_to_bytes(S[4], 8)
+        if p.rate+i<40: buf[p.rate+i]^=key[i]
+    S[0],S[1],S[2],S[3],S[4]=_b2s(bytes(buf)); _perm(S,p.a)
+    buf=bytearray(_s2b(S)); off=40-p.key_len
+    for i in range(p.key_len): buf[off+i]^=key[i]
+    S[0],S[1],S[2],S[3],S[4]=_b2s(bytes(buf))
+    return _i2b(S[3],8)+_i2b(S[4],8)
 
-def ascon_permutation(S: list[int], rounds: int = 1) -> None:
-    for r in range(12 - rounds, 12):
-        S[2] ^= (0xF0 - r * 0x10 + r * 0x1)
-        S[0] ^= S[4]; S[4] ^= S[3]; S[2] ^= S[1]
-        T = [(S[i] ^ 0xFFFFFFFFFFFFFFFF) & S[(i + 1) % 5] for i in range(5)]
-        for i in range(5): S[i] ^= T[(i + 1) % 5]
-        S[1] ^= S[0]; S[0] ^= S[4]; S[3] ^= S[2]; S[2] ^= 0xFFFFFFFFFFFFFFFF
-        S[0] ^= rotr(S[0], 19) ^ rotr(S[0], 28)
-        S[1] ^= rotr(S[1], 61) ^ rotr(S[1], 39)
-        S[2] ^= rotr(S[2], 1)  ^ rotr(S[2], 6)
-        S[3] ^= rotr(S[3], 10) ^ rotr(S[3], 17)
-        S[4] ^= rotr(S[4], 7)  ^ rotr(S[4], 41)
+def _perm(S,rounds):
+    for r in range(12-rounds,12):
+        S[2]^=(0xF0-r*0x10+r*0x1)
+        S[0]^=S[4];S[4]^=S[3];S[2]^=S[1]
+        T=[(S[i]^0xFFFFFFFFFFFFFFFF)&S[(i+1)%5] for i in range(5)]
+        for i in range(5): S[i]^=T[(i+1)%5]
+        S[1]^=S[0];S[0]^=S[4];S[3]^=S[2];S[2]^=0xFFFFFFFFFFFFFFFF
+        S[0]^=_r(S[0],19)^_r(S[0],28); S[1]^=_r(S[1],61)^_r(S[1],39)
+        S[2]^=_r(S[2],1)^_r(S[2],6);   S[3]^=_r(S[3],10)^_r(S[3],17)
+        S[4]^=_r(S[4],7)^_r(S[4],41)
 
-# -------------------- Helpers --------------------
+def _r(v,r): return (v>>r)|((v&((1<<r)-1))<<(64-r))
+def _b2i(b): return int.from_bytes(b,"little")
+def _i2b(i,n): return i.to_bytes(n,"little")
+def _b2s(b): return [_b2i(b[8*w:8*(w+1)]) for w in range(5)]
+def _s2b(S): return b"".join(_i2b(w,8) for w in S)
+def _zb(n): return n*b"\x00"
+def _fb(n): return n*b"\xFF"
+def _hx(s): return bytes.fromhex(s)
 
-def zero_bytes(n: int) -> bytes:     return n * b"\x00"
-def ff_bytes(n: int) -> bytes:       return n * b"\xFF"
-def to_bytes(l: BytesLike | Iterable[int]) -> bytes: return bytes(l)
-def bytes_to_int(b: BytesLike) -> int: return int.from_bytes(b, "little")
-def bytes_to_state(b: bytes) -> list[int]:
-    return [bytes_to_int(b[8 * w:8 * (w + 1)]) for w in range(5)]
-def state_to_bytes(S: list[int]) -> bytes:
-    return b"".join(int_to_bytes(w, 8) for w in S)
-def int_to_bytes(integer: int, nbytes: int) -> bytes:
-    return integer.to_bytes(nbytes, "little")
-def rotr(val: int, r: int) -> int:
-    return (val >> r) | ((val & ((1 << r) - 1)) << (64 - r))
-def hex_to_bytes(s: str) -> bytes: return bytes.fromhex(s)
 
-# -------------------- Keying (must match node) --------------------
-
-def derive_node_master_key(node_id: str) -> bytes:
-    seed = (node_id + "|research-master-key").encode("utf-8")
-    raw  = bytearray(20)
-    acc  = 0
+# ═══════════════════════════════════════════════════════════════════
+#  KEY DERIVATION  (must match node)
+# ═══════════════════════════════════════════════════════════════════
+def derive_key(node_id: str) -> bytes:
+    seed=(node_id+"|research-master-key").encode()
+    raw=bytearray(20); acc=0
     for i in range(20):
-        acc    = (acc + seed[i % len(seed)] + (i * 31)) % 256
-        raw[i] = acc
+        acc=(acc+seed[i%len(seed)]+(i*31))%256; raw[i]=acc
     return bytes(raw)
 
-def profile_key_from_master(master20: bytes, profile: int) -> bytes:
-    if profile == 4: return master20
-    return master20[:16]
+def key_for_profile(master20: bytes, profile: int) -> bytes:
+    return master20 if profile==4 else master20[:16]
 
-# -------------------- Profile Assignment --------------------
 
-SECURITY_PROFILE_NAMES = {
-    1: "Lightweight (IoT)",
-    2: "Standard (default)",
-    3: "High Security",
-    4: "Critical / Long-Term",
+# ═══════════════════════════════════════════════════════════════════
+#  PROFILE ASSIGNMENT
+# ═══════════════════════════════════════════════════════════════════
+PROFILE_NAMES = {
+    1: "Lightweight  (Ascon-128  / 8-byte tag)",
+    2: "Standard     (Ascon-128  / 16-byte tag)",
+    3: "High Security(Ascon-128a / 16-byte tag)",
+    4: "Critical PQ  (Ascon-80pq / 16-byte tag)",
 }
 
-def calculate_profile_from_metrics(metrics: dict) -> int:
-    """
-    Gateway-side profile selection.
-    Receives the node's metric stars, computes the total score,
-    and returns the appropriate profile ID.
-
-    Score = sum_stars * 5  (max 100, since max stars = 20)
-    Profile bands (same as node fallback):
-        score < 43.75  → Profile 1 (Lightweight)
-        score < 62.5   → Profile 2 (Standard)
-        score < 81.25  → Profile 3 (High Security)
-        score >= 81.25 → Profile 4 (Critical / Ascon-80pq)
-    """
-    percent_score = int(metrics.get("percent_score", 0))
-    x = max(0, min(100, percent_score)) / 100.0
-    if x < 0.4375: return 1
-    if x < 0.625:  return 2
-    if x < 0.8125: return 3
+def assign_profile(metrics: dict) -> int:
+    pct = max(0, min(100, int(metrics.get("percent_score", 0)))) / 100.0
+    if pct < 0.4375: return 1
+    if pct < 0.625:  return 2
+    if pct < 0.8125: return 3
     return 4
 
-# -------------------- Scheduling structures --------------------
 
+# ═══════════════════════════════════════════════════════════════════
+#  SCHEDULING STRUCTURES
+# ═══════════════════════════════════════════════════════════════════
 @dataclass
 class InboundItem:
     arrival_ts:    float
@@ -238,107 +199,93 @@ class InboundItem:
     priority_norm: float
     pkt:           dict[str, Any]
 
+AGING_K      = 0.1
+URGENT_FLOOR = 0.95
 
-# -------------------- Announcement tracking --------------------
+def aging_key(priority: float, ts: float) -> float:
+    """
+    Routine:  Key = -(priority - 0.1 * t_arrival)   older = higher priority
+    Urgent:   Key = -9999 - t_arrival                always beats routine
+    """
+    if priority >= URGENT_FLOOR:
+        return -9999.0 - ts
+    return -(priority - AGING_K * ts)
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  FRAGMENT REASSEMBLY BUFFER
+# ═══════════════════════════════════════════════════════════════════
 @dataclass
-class BurstExpectation:
-    """Stores what the gateway expects from an announced urgent burst."""
+class BurstBuffer:
+    """Accumulates decrypted fragments until the burst is complete."""
     node_id:       str
     frag_total:    int
     frag_size:     int
     original_size: int
     profile_id:    int
-    received:      int = 0
     announced_at:  float = field(default_factory=time.time)
+    # slot index → decrypted plaintext bytes
+    fragments:     dict[int, bytes] = field(default_factory=dict)
+
+    @property
+    def received(self) -> int:
+        return len(self.fragments)
+
+    @property
+    def complete(self) -> bool:
+        return self.received >= self.frag_total
+
+    def reassemble(self) -> bytes:
+        """Concatenate fragments in order."""
+        return b"".join(
+            self.fragments[i]
+            for i in sorted(self.fragments)
+        )
 
 
-# -------------------- Mathematical Aging Key --------------------
-#
-#   Key = -(Priority_base - k * t_arrival)
-#
-# With k = 0.1, older packets have a less-negative key and surface first.
-# No periodic re-sort required.
-#
-# URGENT PRIORITY FLOOR:
-# Packets with priority_norm >= URGENT_FLOOR bypass the aging formula
-# and always receive a key of -9999.0, guaranteeing they are processed
-# before any routine packet regardless of how long routine packets have aged.
-
-AGING_K       = 0.1     # aging coefficient
-URGENT_FLOOR  = 0.95    # priority_norm threshold for urgent treatment
-
-
-def aging_key(priority_norm: float, arrival_ts: float) -> float:
-    """
-    Return the heap key implementing mathematical aging + urgent priority floor.
-
-    heapq is a min-heap so lower (more negative) key = processed first.
-
-    Urgent fragments (priority_norm >= 0.95):
-        Key = -9999.0  (always processed before any routine packet)
-
-    Routine packets:
-        Key = -(Priority_base - k * t_arrival)
-    """
-    if priority_norm >= URGENT_FLOOR:
-        # Urgent: fixed floor key so they always beat routine packets.
-        # Use arrival_ts as a tiebreaker among urgent fragments themselves
-        # so older urgent fragments are still processed first.
-        return -9999.0 - arrival_ts
-    return -(priority_norm - AGING_K * arrival_ts)
-
-
-# -------------------- Decryption --------------------
-
-def compute_priority_from_packet(pkt: dict[str, Any]) -> float:
-    """
-    Read priority directly from packet if present (urgent fragments embed 1.0),
-    otherwise compute from length_stars + criticality_stars.
-    """
+# ═══════════════════════════════════════════════════════════════════
+#  PRIORITY EXTRACTION
+# ═══════════════════════════════════════════════════════════════════
+def get_priority(pkt: dict) -> float:
     explicit = pkt.get("priority_norm")
     if explicit is not None:
         return float(explicit)
     m = pkt.get("metrics", {})
-    length_stars      = int(m.get("length_stars", 0))
-    criticality_stars = int(m.get("criticality_stars", 0))
-    raw = length_stars + criticality_stars
-    return max(0.0, min(1.0, raw / 8.0))
+    ls = int(m.get("length_stars", 0))
+    cs = int(m.get("criticality_stars", 0))
+    return max(0.0, min(1.0, (ls + cs) / 8.0))
 
 
-def try_decrypt(pkt: dict[str, Any]) -> bytes | None:
-    sec        = pkt.get("security", {})
-    variant    = sec.get("variant", "Ascon-128")
-    tag_len    = int(sec.get("tag_len", 16))
-    profile_id = int(sec.get("profile_id", 2))
-    node_id    = str(pkt.get("node_id"))
-    ad         = hex_to_bytes(pkt["ad_hex"])
-    nonce      = hex_to_bytes(pkt["nonce_hex"])
-    ct         = hex_to_bytes(pkt["ct_hex"])
-    master     = derive_node_master_key(node_id)
-    key        = profile_key_from_master(master, profile_id)
+# ═══════════════════════════════════════════════════════════════════
+#  DECRYPTION HELPER
+# ═══════════════════════════════════════════════════════════════════
+def decrypt_packet(pkt: dict) -> bytes | None:
+    sec     = pkt.get("security", {})
+    variant = sec.get("variant", "Ascon-128")
+    tag_len = int(sec.get("tag_len", 16))
+    pid     = int(sec.get("profile_id", 2))
+    node_id = str(pkt.get("node_id", ""))
+    master  = derive_key(node_id)
+    key     = key_for_profile(master, pid)
     return ascon_decrypt(
-        key=key, nonce=nonce, associateddata=ad,
-        ciphertext=ct, variant=variant, tag_len=tag_len,
+        key   = key,
+        nonce = _hx(pkt["nonce_hex"]),
+        ad    = _hx(pkt["ad_hex"]),
+        ct    = _hx(pkt["ct_hex"]),
+        variant = variant,
+        tag_len = tag_len,
     )
 
 
-# -------------------- Shared Gateway State --------------------
+# ═══════════════════════════════════════════════════════════════════
+#  CLUSTER HEAD STATE  (shared across threads)
+# ═══════════════════════════════════════════════════════════════════
+class ClusterHeadState:
+    def __init__(self, stage_a_seconds: float):
+        self.start_ts        = time.time()
+        self.stage_a_seconds = stage_a_seconds
 
-class GatewayState:
-    """
-    Thread-safe container for all mutable gateway state.
-    Three threads share this object:
-      - Main receiver thread (writes packets)
-      - GW-Processor thread (reads/pops packets)
-      - Profile-Server thread (reads nothing here, writes nothing here)
-    """
-
-    def __init__(self, time_scheduler_seconds: float):
-        self.start_ts               = time.time()
-        self.time_scheduler_seconds = time_scheduler_seconds
-
-        self.lock      = threading.Lock()
+        self.lock          = threading.Lock()
         self.fifo:  list[InboundItem]                      = []
         self.heap:  list[tuple[float, float, InboundItem]] = []
         self.stage_a_ended = False
@@ -348,295 +295,288 @@ class GatewayState:
 
         self.work_q: queue.Queue[tuple[InboundItem, str]] = queue.Queue()
 
-        # Burst expectation tracking: node_id -> BurstExpectation
-        self._burst_lock         = threading.Lock()
-        self._burst_expectations: dict[str, BurstExpectation] = {}
+        # Fragment reassembly: (node_id) -> BurstBuffer
+        self._burst_lock    = threading.Lock()
+        self._bursts: dict[str, BurstBuffer] = {}
 
-    # ── helpers ──────────────────────────────────────────────────────────────
-
+    # ── timing ──────────────────────────────────────────────────────
     def elapsed(self) -> float:
         return time.time() - self.start_ts
 
     def stage_a_active(self) -> bool:
-        return self.elapsed() < self.time_scheduler_seconds
+        return self.elapsed() < self.stage_a_seconds
 
-    def add_bytes(self, n: int) -> None:
-        with self._bytes_lock:
-            self._total_bytes += n
+    # ── bytes / throughput ───────────────────────────────────────────
+    def add_bytes(self, n: int):
+        with self._bytes_lock: self._total_bytes += n
 
     def total_bytes(self) -> int:
-        with self._bytes_lock:
-            return self._total_bytes
+        with self._bytes_lock: return self._total_bytes
 
     def throughput_kbps(self) -> float:
-        elapsed = max(1.0, self.elapsed())
-        return (self.total_bytes() / elapsed) / 1024.0
+        return (self.total_bytes() / max(1.0, self.elapsed())) / 1024.0
 
-    # ── burst announcement tracking ──────────────────────────────────────────
-
-    def register_burst(self, node_id: str, ann: dict) -> None:
-        """Store what we expect from an announced urgent burst."""
-        exp = BurstExpectation(
-            node_id=node_id,
-            frag_total=int(ann.get("frag_total", 0)),
-            frag_size=int(ann.get("frag_size", 0)),
-            original_size=int(ann.get("original_size", 0)),
-            profile_id=int(ann.get("profile_id", 1)),
+    # ── burst announcement ───────────────────────────────────────────
+    def register_burst(self, node_id: str, ann: dict):
+        buf = BurstBuffer(
+            node_id       = node_id,
+            frag_total    = int(ann.get("frag_total", 0)),
+            frag_size     = int(ann.get("frag_size", 40)),
+            original_size = int(ann.get("original_size", 0)),
+            profile_id    = int(ann.get("profile_id", 1)),
         )
         with self._burst_lock:
-            self._burst_expectations[node_id] = exp
-        print(
-            f"\n[gateway] 📢 Burst announcement from {node_id}: "
-            f"expecting {exp.frag_total} fragments × ~{exp.frag_size}B "
-            f"(total {exp.original_size}B) using Profile {exp.profile_id}"
-        )
+            self._bursts[node_id] = buf
+        divider()
+        print(MAGENTA(f"  📢  BURST ANNOUNCEMENT from {node_id}"))
+        print(f"      Expecting : {BOLD(str(buf.frag_total))} fragments × ~{buf.frag_size}B")
+        print(f"      Total size: {BOLD(str(buf.original_size))} bytes")
+        print(f"      Profile   : {buf.profile_id} — {PROFILE_NAMES.get(buf.profile_id,'?')}")
+        divider()
 
-    def record_fragment(self, node_id: str, frag_size: int, declared_frag_size: int) -> None:
+    def add_fragment(self, node_id: str, frag_idx: int,
+                     plaintext: bytes, declared_frag_size: int) -> BurstBuffer | None:
         """
-        Track an arriving fragment against the announced expectation.
-        Prints a warning if the fragment size doesn't match what was declared.
+        Store a decrypted fragment.  Returns the BurstBuffer once complete,
+        None if still waiting for more fragments.
         """
         with self._burst_lock:
-            exp = self._burst_expectations.get(node_id)
-            if exp is None:
-                return
-            exp.received += 1
+            buf = self._bursts.get(node_id)
+            if buf is None:
+                return None
+            # Size validation
+            if frag_idx < buf.frag_total - 1:   # not the last fragment
+                if len(plaintext) != buf.frag_size:
+                    delta = abs(len(plaintext) - buf.frag_size)
+                    print(RED(f"  🚨 SIZE MISMATCH frag {frag_idx} from {node_id}! "
+                              f"Got {len(plaintext)}B expected {buf.frag_size}B "
+                              f"(Δ={delta}B) — possible injection/corruption"))
+            buf.fragments[frag_idx] = plaintext
+            if buf.complete:
+                del self._bursts[node_id]
+                return buf
+        return None
 
-            # Size validation — last fragment is allowed to be smaller
-            if frag_size != declared_frag_size and frag_size != exp.frag_size:
-                delta = abs(frag_size - exp.frag_size)
-                print(
-                    f"🚨 [ATTACK/FAILURE] Fragment size mismatch from {node_id}! "
-                    f"Expected ~{exp.frag_size}B, got {frag_size}B "
-                    f"(delta={delta}B). Possible injection or corruption."
-                )
-
-            # Check if burst is complete
-            if exp.received >= exp.frag_total:
-                print(
-                    f"[gateway] ✅ Burst from {node_id} complete: "
-                    f"{exp.received}/{exp.frag_total} fragments received."
-                )
-                del self._burst_expectations[node_id]
-
-    # ── stage transition ──────────────────────────────────────────────────────
-
-    def transition_to_stage_b(self) -> None:
+    # ── stage transition ─────────────────────────────────────────────
+    def transition_to_stage_b(self):
         with self.lock:
-            if self.stage_a_ended:
-                return
+            if self.stage_a_ended: return
             count = len(self.fifo)
             while self.fifo:
-                old_item = self.fifo.pop(0)
-                key = aging_key(old_item.priority_norm, old_item.arrival_ts)
-                heapq.heappush(self.heap, (key, old_item.arrival_ts, old_item))
+                item = self.fifo.pop(0)
+                k = aging_key(item.priority_norm, item.arrival_ts)
+                heapq.heappush(self.heap, (k, item.arrival_ts, item))
             self.stage_a_ended = True
         if count:
-            print(f"\n[gateway] Transition: moved {count} Stage-A packet(s) into Stage-B heap.")
+            print(YELLOW(f"\n  ⚡ Transition: {count} FIFO packet(s) moved to Priority Heap\n"))
 
-    # ── enqueue ───────────────────────────────────────────────────────────────
-
-    def enqueue_stage_a(self, item: InboundItem) -> None:
+    # ── enqueue ──────────────────────────────────────────────────────
+    def enqueue_stage_a(self, item: InboundItem):
         with self.lock:
             self.fifo.append(item)
             out = self.fifo.pop(0)
         self.work_q.put((out, "A"))
 
-    def enqueue_stage_b(self, item: InboundItem) -> None:
-        key = aging_key(item.priority_norm, item.arrival_ts)
+    def enqueue_stage_b(self, item: InboundItem):
+        k = aging_key(item.priority_norm, item.arrival_ts)
         with self.lock:
-            heapq.heappush(self.heap, (key, item.arrival_ts, item))
-        self._drain_heap_to_work_q()
+            heapq.heappush(self.heap, (k, item.arrival_ts, item))
+        self._drain()
 
-    def _drain_heap_to_work_q(self) -> None:
+    def _drain(self):
         with self.lock:
             if self.heap:
                 _, _, out = heapq.heappop(self.heap)
                 self.work_q.put((out, "B"))
 
 
-# -------------------- Profile Server Thread (port 9998) --------------------
-
-def profile_server_thread(state: GatewayState, bind_host: str, profile_port: int) -> None:
-    """
-    Listens on port 9998 for profile_request packets from nodes.
-    Calculates the profile from the node's metrics and replies immediately.
-
-    This runs in a dedicated daemon thread so it never blocks the main
-    packet receiver on port 9999.
-    """
-    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    srv_sock.bind((bind_host, profile_port))
-    srv_sock.settimeout(0.5)
-
-    print(f"[gateway] Profile server listening on {bind_host}:{profile_port}")
+# ═══════════════════════════════════════════════════════════════════
+#  PROFILE SERVER THREAD  (port 9998)
+# ═══════════════════════════════════════════════════════════════════
+def profile_server_thread(state: ClusterHeadState,
+                          bind_host: str, profile_port: int):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    srv.bind((bind_host, profile_port))
+    srv.settimeout(0.5)
+    print(GREEN(f"  [Profile Server] Listening on {bind_host}:{profile_port}"))
 
     while True:
         try:
-            data, addr = srv_sock.recvfrom(4096)
+            data, addr = srv.recvfrom(4096)
         except socket.timeout:
             continue
-
         try:
-            req = json.loads(data.decode("utf-8"))
+            req = json.loads(data.decode())
         except json.JSONDecodeError:
             continue
-
         if req.get("type") != "profile_request":
             continue
 
-        node_id  = str(req.get("node_id", "unknown"))
-        metrics  = req.get("metrics", {})
-        profile  = calculate_profile_from_metrics(metrics)
-        pname    = SECURITY_PROFILE_NAMES.get(profile, "Unknown")
+        node_id = str(req.get("node_id", "unknown"))
+        metrics = req.get("metrics", {})
+        profile = assign_profile(metrics)
+        pname   = PROFILE_NAMES.get(profile, "?")
+        cts     = metrics.get("cts_score", 0.0)
+        stars   = metrics.get("sum_stars", 0)
+        pct     = metrics.get("percent_score", 0)
+        syn     = metrics.get("n_syn_recv", 0)
+        cw      = metrics.get("n_close_wait", 0)
+        tw      = metrics.get("n_time_wait", 0)
 
-        # Print what the gateway sees and decided
-        cts   = metrics.get("cts_score", 0.0)
-        nas   = metrics.get("nas_score", 0.0)
-        syn   = metrics.get("n_syn_recv", 0)
-        cw    = metrics.get("n_close_wait", 0)
-        tw    = metrics.get("n_time_wait", 0)
-        stars = metrics.get("sum_stars", 0)
-        pct   = metrics.get("percent_score", 0)
+        print(CYAN(f"\n  [Profile Server] ← {node_id} @ {addr[0]}"))
+        print(f"    Stars : {stars}/20 ({pct}%)  |  CTS={cts:.3f}  "
+              f"|  SYN={syn} CW={cw} TW={tw}")
+        print(GREEN(f"    → Assigned Profile {profile}: {pname}"))
 
-        print(
-            f"\n[profile-server] Request from {node_id} @ {addr[0]} | "
-            f"Stars={stars}/20 ({pct}%) | "
-            f"CTS={cts:.3f} NAS={nas:.3f} | "
-            f"SYN={syn} CW={cw} TW={tw}"
-        )
-        print(f"[profile-server] → Assigned Profile {profile} ({pname}) to {node_id}")
-
-        response = {
-            "type":       "profile_response",
-            "node_id":    node_id,
-            "profile_id": profile,
+        srv.sendto(json.dumps({
+            "type":         "profile_response",
+            "node_id":      node_id,
+            "profile_id":   profile,
             "profile_name": pname,
-        }
-        srv_sock.sendto(json.dumps(response).encode("utf-8"), addr)
+        }).encode(), addr)
 
 
-# -------------------- Processor Thread --------------------
+# ═══════════════════════════════════════════════════════════════════
+#  PROCESSOR THREAD
+# ═══════════════════════════════════════════════════════════════════
+def processor_thread(state: ClusterHeadState, do_decrypt: bool):
+    print(GREEN("  [Processor] Event-driven worker started (zero sleep)"))
 
-def processor_thread(state: GatewayState, do_decrypt: bool) -> None:
-    """
-    Event-driven worker: blocks on work_q.get(timeout=0.1).
-    Wakes the microsecond a packet is enqueued — zero artificial delay.
-    """
-    print("[gateway] Processor thread started (event-driven, no sleep).")
     while True:
         try:
             item, stage = state.work_q.get(timeout=0.1)
         except queue.Empty:
-            state._drain_heap_to_work_q()
+            state._drain()
             continue
 
+        pkt       = item.pkt
         now       = time.time()
-        delay_ms  = (now - item.pkt["ts"]) * 1000.0
-        tput_kbps = state.throughput_kbps()
+        delay_ms  = (now - pkt["ts"]) * 1000.0
+        tput      = state.throughput_kbps()
+        is_urgent = item.priority_norm >= URGENT_FLOOR
+        frag_info = pkt.get("fragment", {})
+        is_frag   = frag_info.get("is_fragment", False)
 
-        # Is this an urgent fragment?
-        frag_info  = item.pkt.get("fragment", {})
-        is_frag    = frag_info.get("is_fragment", False)
-        frag_label = ""
+        # ── stage label ──────────────────────────────────────────────
+        stage_label = (GREEN("Stage A │ FIFO") if stage == "A"
+                       else YELLOW("Stage B │ Priority"))
+        urgent_tag  = RED(" 🚨 URGENT") if is_urgent else ""
+
+        divider()
         if is_frag:
-            fi    = frag_info.get("frag_index", 0) + 1
-            ft    = frag_info.get("frag_total", 0)
-            fsize = frag_info.get("frag_size", 0)
-            frag_label = f" [frag {fi}/{ft}]"
-            # Record fragment against announcement
-            state.record_fragment(item.node_id, fsize, fsize)
+            fi = frag_info.get("frag_index", 0)
+            ft = frag_info.get("frag_total", 0)
+            print(f"  ◀ [{stage_label}]{urgent_tag}  "
+                  f"{BOLD(item.node_id)}  Seq={item.seq:04d}  "
+                  f"Fragment {fi+1}/{ft}")
+        else:
+            print(f"  ◀ [{stage_label}]{urgent_tag}  "
+                  f"{BOLD(item.node_id)}  Seq={item.seq:04d}")
 
-        label = "Stage A Out" if stage == "A" else "Stage B Out"
-        urgent_tag = " 🚨URGENT" if item.priority_norm >= URGENT_FLOOR else ""
+        print(f"    Priority : {item.priority_norm:.3f}  │  "
+              f"Delay : {CYAN(f'{delay_ms:.2f} ms')}  │  "
+              f"Throughput : {CYAN(f'{tput:.3f} KB/s')}")
 
-        print(
-            f"<- [{label}]{urgent_tag}{frag_label} "
-            f"Node: {item.node_id} Seq: {item.seq:04d} | "
-            f"Prio: {item.priority_norm:.3f} | "
-            f"Delay: {delay_ms:.3f} ms | "
-            f"Throughput: {tput_kbps:.3f} KB/s"
-        )
-
+        # ── decrypt ──────────────────────────────────────────────────
+        plaintext = None
         if do_decrypt:
             t0        = time.perf_counter()
-            decrypted = try_decrypt(item.pkt)
+            plaintext = decrypt_packet(pkt)
             dec_us    = (time.perf_counter() - t0) * 1_000_000
-            status    = "OK" if decrypted is not None else "FAIL"
-            print(f"   Decrypt: {status}  ({dec_us:.2f} µs)")
+            status    = GREEN("✔ OK") if plaintext is not None else RED("✘ FAIL")
+            print(f"    Decrypt  : {status}  ({dec_us:.1f} µs)  │  "
+                  f"Profile {pkt.get('security',{}).get('profile_id','?')} "
+                  f"— {pkt.get('security',{}).get('variant','?')}")
+
+        # ── fragment reassembly ──────────────────────────────────────
+        if is_frag and do_decrypt and plaintext is not None:
+            fi       = frag_info.get("frag_index", 0)
+            dec_size = frag_info.get("frag_size", len(plaintext))
+            buf = state.add_fragment(item.node_id, fi, plaintext, dec_size)
+
+            if buf is not None:
+                # All fragments collected — reassemble
+                reassembled = buf.reassemble()
+                divider("─")
+                print(MAGENTA(f"  ✅  BURST REASSEMBLY COMPLETE — {item.node_id}"))
+                print(f"      Fragments received : {buf.frag_total}/{buf.frag_total}")
+                print(f"      Reassembled size   : {BOLD(str(len(reassembled)))} bytes")
+                print(f"      Announced size     : {BOLD(str(buf.original_size))} bytes  ", end="")
+                if len(reassembled) == buf.original_size:
+                    print(GREEN("✔  MATCH — Transmission Integrity Verified"))
+                else:
+                    delta = abs(len(reassembled) - buf.original_size)
+                    print(RED(f"✘  MISMATCH (Δ={delta}B) — Possible Attack / Data Loss"))
+                divider("─")
 
         state.work_q.task_done()
 
 
-# -------------------- Receiver (main) Thread --------------------
-
-def main() -> None:
+# ═══════════════════════════════════════════════════════════════════
+#  MAIN — RECEIVER THREAD
+# ═══════════════════════════════════════════════════════════════════
+def main():
+    global USE_COLOUR
     ap = argparse.ArgumentParser(
-        description="IoT Gateway – Profile Assignment | Event-Driven | Mathematical Aging"
-    )
+        description="IoT Cluster Head — Profile Assignment | Scheduling | Reassembly")
     ap.add_argument("--bind-host",              default="0.0.0.0")
-    ap.add_argument("--bind-port",              type=int, default=9999,
-                    help="UDP port for encrypted data packets")
-    ap.add_argument("--profile-port",           type=int, default=9998,
-                    help="UDP port for profile request/response with nodes")
-    ap.add_argument("--time-scheduler-seconds", type=float, default=20.0,
-                    help="Duration of Stage A (FIFO) before switching to Stage B (Priority)")
+    ap.add_argument("--bind-port",              type=int, default=9999)
+    ap.add_argument("--profile-port",           type=int, default=9998)
+    ap.add_argument("--time-scheduler-seconds", type=float, default=20.0)
     ap.add_argument("--process-interval",       type=float, default=1.0,
-                    help="(Legacy parameter – retained for CLI compatibility.)")
-    ap.add_argument("--decrypt",                action="store_true",
-                    help="Attempt to decrypt and verify each message")
+                    help="Legacy — kept for CLI compatibility, not used")
+    ap.add_argument("--decrypt",  action="store_true")
+    ap.add_argument("--no-colour",action="store_true")
     args = ap.parse_args()
 
-    # ── Data socket (port 9999) ───────────────────────────────────────────────
+    if args.no_colour:
+        USE_COLOUR = False
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.bind_host, args.bind_port))
     sock.settimeout(0.05)
 
-    state = GatewayState(time_scheduler_seconds=args.time_scheduler_seconds)
+    state = ClusterHeadState(stage_a_seconds=args.time_scheduler_seconds)
 
-    print(f"[gateway] Data socket listening on {args.bind_host}:{args.bind_port}")
-    print(f"[gateway] Stage A (FIFO) for {args.time_scheduler_seconds}s "
-          f"→ Stage B (Priority + Aging)")
-    print(f"[gateway] Aging formula: Key = -(Priority_base - k*t_arrival)  k={AGING_K}")
-    print(f"[gateway] Urgent floor: priority_norm >= {URGENT_FLOOR} → Key = -9999 - t_arrival")
-    print(f"[gateway] Decrypt={args.decrypt}")
+    # ── startup banner ───────────────────────────────────────────────
+    section("IoT CLUSTER HEAD — STARTING UP")
+    print(f"  Data port    : {BOLD(str(args.bind_port))}   (encrypted packets)")
+    print(f"  Profile port : {BOLD(str(args.profile_port))}   (profile assignment)")
+    print(f"  Stage A      : FIFO for {args.time_scheduler_seconds}s")
+    print(f"  Stage B      : Priority + Aging  Key=-(p-{AGING_K}×t)")
+    print(f"  Urgent floor : priority ≥ {URGENT_FLOOR} → Key=-9999-t")
+    print(f"  Decrypt      : {GREEN('ON') if args.decrypt else DIM('OFF')}")
+    print(f"  Reassembly   : {GREEN('ON') if args.decrypt else DIM('OFF (needs --decrypt)')}")
+    divider()
     print()
 
-    # ── Profile server thread (port 9998) ────────────────────────────────────
-    prof_thread = threading.Thread(
+    # ── start threads ────────────────────────────────────────────────
+    threading.Thread(
         target=profile_server_thread,
         args=(state, args.bind_host, args.profile_port),
-        daemon=True,
-        name="GW-ProfileServer",
-    )
-    prof_thread.start()
+        daemon=True, name="ProfileServer"
+    ).start()
 
-    # ── Processor thread ──────────────────────────────────────────────────────
-    proc_thread = threading.Thread(
+    threading.Thread(
         target=processor_thread,
         args=(state, args.decrypt),
-        daemon=True,
-        name="GW-Processor",
-    )
-    proc_thread.start()
+        daemon=True, name="Processor"
+    ).start()
 
-    stage_b_announced = False
+    stage_b_shown = False
 
     try:
         while True:
-            # ── Stage transition ──────────────────────────────────────────────
+            # ── stage transition ──────────────────────────────────────
             if not state.stage_a_active() and not state.stage_a_ended:
-                print(f"\n[gateway] Stage A expired at t={state.elapsed():.1f}s. "
-                      "Transitioning to Stage B (Priority Scheduling).")
+                section(f"SWITCHING TO STAGE B — Priority Scheduling (t={state.elapsed():.1f}s)")
                 state.transition_to_stage_b()
 
-            if state.stage_a_ended and not stage_b_announced:
-                print(f"[gateway] Stage B active. "
-                      f"Key = -(p - {AGING_K}*t_arrival) | "
-                      f"Urgent floor at prio >= {URGENT_FLOOR}\n")
-                stage_b_announced = True
+            if state.stage_a_ended and not stage_b_shown:
+                print(YELLOW("  Stage B active │ Key = -(priority − 0.1 × t_arrival)\n"))
+                stage_b_shown = True
 
-            # ── Receive packet ────────────────────────────────────────────────
+            # ── receive ───────────────────────────────────────────────
             try:
                 data, addr = sock.recvfrom(65535)
             except socket.timeout:
@@ -645,55 +585,60 @@ def main() -> None:
             state.add_bytes(len(data))
 
             try:
-                pkt = json.loads(data.decode("utf-8"))
+                pkt = json.loads(data.decode())
             except json.JSONDecodeError:
-                print(f"[gateway] Malformed packet from {addr}, ignored.")
+                print(RED(f"  [!] Malformed packet from {addr}"))
                 continue
 
-            pkt_type = pkt.get("type")
+            ptype = pkt.get("type")
 
-            # ── Handle announcement packet ────────────────────────────────────
-            if pkt_type == "urgent_announcement":
-                node_id = str(pkt.get("node_id", "unknown"))
-                state.register_burst(node_id, pkt)
+            # ── announcement packet ───────────────────────────────────
+            if ptype == "urgent_announcement":
+                state.register_burst(str(pkt.get("node_id", "?")), pkt)
                 continue
 
-            # ── Handle normal / fragment data packets ─────────────────────────
-            if pkt_type != "ascon_node_msg":
+            if ptype != "ascon_node_msg":
                 continue
 
             node_id = str(pkt.get("node_id", "unknown"))
             seq     = int(pkt.get("seq", 0))
-            pr      = compute_priority_from_packet(pkt)
+            pr      = get_priority(pkt)
             now     = time.time()
 
             item = InboundItem(
-                arrival_ts=now,
-                node_id=node_id,
-                seq=seq,
-                priority_norm=pr,
-                pkt=pkt,
-            )
+                arrival_ts=now, node_id=node_id,
+                seq=seq, priority_norm=pr, pkt=pkt)
 
-            is_urgent = pr >= URGENT_FLOOR
-            tag       = " 🚨URGENT" if is_urgent else ""
+            is_urgent  = pr >= URGENT_FLOOR
+            urgent_tag = RED(" 🚨 URGENT") if is_urgent else ""
+            is_frag    = pkt.get("fragment", {}).get("is_fragment", False)
+            frag_label = ""
+            if is_frag:
+                fi = pkt["fragment"].get("frag_index", 0) + 1
+                ft = pkt["fragment"].get("frag_total", 0)
+                frag_label = f"  Fragment {fi}/{ft}"
 
             if state.stage_a_active():
-                print(f"-> [Stage A In]{tag}  Node: {node_id}  Seq: {seq:04d}  Prio: {pr:.3f}")
+                print(f"  ▶ [{GREEN('Stage A')}]{urgent_tag}  "
+                      f"{BOLD(node_id)}  Seq={seq:04d}  "
+                      f"Prio={pr:.3f}{frag_label}")
                 state.enqueue_stage_a(item)
             else:
-                key_val = aging_key(pr, now)
-                print(
-                    f"-> [Stage B In]{tag}  Node: {node_id}  Seq: {seq:04d}  "
-                    f"Prio: {pr:.3f}  Key: {key_val:.4f}"
-                )
+                k = aging_key(pr, now)
+                print(f"  ▶ [{YELLOW('Stage B')}]{urgent_tag}  "
+                      f"{BOLD(node_id)}  Seq={seq:04d}  "
+                      f"Prio={pr:.3f}  Key={k:.2f}{frag_label}")
                 state.enqueue_stage_b(item)
 
     except KeyboardInterrupt:
-        print("\n[gateway] Interrupted by user. Shutting down.")
+        print()
+        section("CLUSTER HEAD SHUTTING DOWN")
+        print(f"  Total bytes received : {state.total_bytes():,}")
+        print(f"  Total time           : {state.elapsed():.1f}s")
+        print(f"  Avg throughput       : {state.throughput_kbps():.3f} KB/s")
+        divider()
     finally:
         sock.close()
-        print("[gateway] Socket closed.")
 
 
 if __name__ == "__main__":
