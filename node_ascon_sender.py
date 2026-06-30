@@ -1065,6 +1065,7 @@ def main() -> None:
     sock            = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     gateway_addr    = (args.gateway_host, args.gateway_port)
     associated_data = args.ad.encode("utf-8")
+    mode            = args.length_mode.lower().strip()
 
     print(f"\033[96m{'═'*70}\033[0m")
     print(f"\033[1m\033[96m  IoT SENSOR NODE — STARTING UP\033[0m")
@@ -1079,7 +1080,6 @@ def main() -> None:
 
     seq      = 0
     infinite = (args.count == 0)
-    mode     = args.length_mode.lower().strip()
 
     try:
         # ── MODE: urgent ──────────────────────────────────────────────────────
