@@ -779,8 +779,9 @@ def build_and_send_packet(
           f"CTS={YELLOW(f'{cts:.3f}')}  "
           f"CPU {cpus}★ ({cpup:.0f}%)  "
           f"RAM {rams}★ ({ramp:.0f}%)")
-    print(f"    Score    : {BOLD(str(ss) + '/20')} ({pct}%)  "
-          f"│  Priority={BOLD(f'{pr:.3f}')}")
+    print(f"    Score    : {BOLD(str(ss) + '/20 node★')} ({pct}%)  "
+          f"│  Priority={BOLD(f'{pr:.3f}')}  "
+          f"│  {DIM('Gateway adds up to 8★ more')}")
     print(f"    ⚡ Energy : P={e['power_w']:.3f}W  │  "
           f"Enc={e['enc_time_us']:.1f}µs  │  "
           f"E={e['energy_j']:.9f}J  ({e['energy_uj']:.3f}µJ)")
@@ -1067,16 +1068,18 @@ def main() -> None:
     associated_data = args.ad.encode("utf-8")
     mode            = args.length_mode.lower().strip()
 
-    print(f"\033[96m{'═'*70}\033[0m")
+    print(f"\033[96m{'═'*72}\033[0m")
     print(f"\033[1m\033[96m  IoT SENSOR NODE — STARTING UP\033[0m")
-    print(f"\033[96m{'═'*70}\033[0m")
+    print(f"\033[96m{'═'*72}\033[0m")
     print(f"  Node ID      : {BOLD(args.node_id)}")
     print(f"  Cluster Head : {BOLD(args.gateway_host)}:{args.gateway_port}")
     print(f"  Profile port : {BOLD(str(args.profile_port))}")
     print(f"  Mode         : {BOLD(mode)}")
+    print(f"  Node scoring : 5 metrics × 4★ max = 20★  (sent to cluster head)")
+    print(f"  Full scoring : 20★ (node) + 8★ (gateway) = 28★ total")
     print(f"  Threat model : NAS=(S+0.5C+0.25T)/{THREAT_NORM}  CTS={THREAT_BASELINE}+{1-THREAT_BASELINE}*NAS")
     print(f"  Energy model : P={IDLE_POWER_W}+{POWER_RANGE_W}*(CPU/100)W  E=P*t")
-    print(f"\033[96m{'─'*70}\033[0m\n")
+    print(f"\033[96m{'─'*72}\033[0m\n")
 
     seq      = 0
     infinite = (args.count == 0)
