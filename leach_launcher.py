@@ -79,6 +79,89 @@ def leach_threshold(P: float, round_num: int, served_recently: bool) -> float:
     return P / denom
 
 
+def wait_for_all_peers(my_id: str, my_ip: str, peers: list[str],
+                       round_num: int) -> None:
+    """
+    Synchronization barrier: block until THIS node can confirm that every
+    peer is online and ready for this round. This guarantees all nodes start
+    their election window at (approximately) the same moment, so their
+    3-second windows overlap and they always agree on the winner.
+
+    Protocol:
+      - Every node repeatedly broadcasts a READY beacon for this round.
+      - Every node listens for READY beacons from all peers.
+      - Once we've heard from every peer AND sent enough beacons that they've
+        surely heard us, the barrier releases.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("0.0.0.0", ELECTION_PORT))
+    except OSError:
+        time.sleep(1.0)
+        try:
+            sock.bind(("0.0.0.0", ELECTION_PORT))
+        except OSError:
+            print(RED("  [SYNC] Election port busy — proceeding without barrier"))
+            sock.close()
+            return
+    sock.settimeout(0.2)
+
+    beacon = json.dumps({
+        "type": "ready_beacon",
+        "node_id": my_id,
+        "ip": my_ip,
+        "round": round_num,
+    }).encode()
+
+    seen_peers: set[str] = set()
+    print(YELLOW(f"  [SYNC] Waiting for all {len(peers)} peer(s) to come online..."))
+
+    last_send = 0.0
+    confirmed_since = None
+
+    while True:
+        now = time.time()
+        # Broadcast our readiness
+        if now - last_send > 0.5:
+            for peer in peers:
+                try:
+                    sock.sendto(beacon, (peer, ELECTION_PORT))
+                except Exception:
+                    pass
+            last_send = now
+
+        # Listen for peer beacons
+        try:
+            data, addr = sock.recvfrom(2048)
+            msg = json.loads(data.decode())
+            if msg.get("type") == "ready_beacon":
+                peer_ip = msg.get("ip")
+                if peer_ip in peers and peer_ip not in seen_peers:
+                    seen_peers.add(peer_ip)
+                    print(GREEN(f"  [SYNC] Peer online: {peer_ip} "
+                                f"({len(seen_peers)}/{len(peers)})"))
+        except socket.timeout:
+            pass
+        except Exception:
+            pass
+
+        # Barrier release condition: all peers seen, and we keep broadcasting
+        # for a short grace period so slower peers also confirm us.
+        if len(seen_peers) >= len(peers):
+            if confirmed_since is None:
+                confirmed_since = now
+                print(GREEN(f"  [SYNC] All peers online — syncing for 2s grace..."))
+            # Keep sending beacons during grace so peers confirm us too
+            elif now - confirmed_since >= 2.0:
+                break
+
+    sock.close()
+    print(GREEN(f"  [SYNC] Barrier released — all nodes ready for round {round_num}\n"))
+    # Brief settle so the port fully releases before the election rebinds it
+    time.sleep(0.3)
+
+
 def run_election(my_id: str, my_ip: str, peers: list[str],
                  P: float, round_num: int, served_recently: bool,
                  election_window: float = 3.0) -> str:
@@ -218,6 +301,13 @@ def main():
         served_recently = (round_num - last_served_round) < cycle
 
         banner(f"ROUND {round_num} — ELECTION PHASE", CYAN)
+
+        # ── Synchronization barrier ───────────────────────────────────
+        # Wait until every peer is online so all nodes elect together.
+        # This prevents the "both became gateway" race where windows
+        # don't overlap. The 60-second round only starts after this.
+        wait_for_all_peers(args.node_id, args.my_ip, peers, round_num)
+
         winner_ip = run_election(
             args.node_id, args.my_ip, peers,
             args.P, round_num, served_recently,
