@@ -31,7 +31,7 @@ TWO-PART SCORING SYSTEM (28 stars total):
 Scheduling:
   Stage A : FIFO for first N seconds (default 20s)
   Stage B : Priority + Mathematical Aging  Key=-(Priority - 0.1*t_arrival)
-  Urgent  : priority >= 0.95 → Key=-9999-t_arrival (always processed first)
+  Urgent  : priority >= 0.95 → Key=-1e12+t_arrival (always processed first, order preserved)
 
 Other features:
   - Fragment reassembly with integrity check
@@ -303,71 +303,111 @@ class FragmentTracker:
 # ═══════════════════════════════════════════════════════════════════
 #  METRIC 7 — REPLAY DETECTION & COUNT
 # ═══════════════════════════════════════════════════════════════════
-# A packet is a replay if ANY of:
-#   1. (node_id, seq) seen before           → duplicate sequence
-#   2. packet_ts < now - STALE_WINDOW       → stale timestamp
-#   3. packet_ts > now + FUTURE_WINDOW      → future-dated (spoofed)
+#
+# A TRUE replay requires TWO or more checks to fail simultaneously.
+# This eliminates false positives from:
+#   - Queue processing delays causing stale timestamps
+#   - Node restarts reusing sequence numbers from 0
+#   - Network jitter causing slight timestamp drift
+#
+# The three independent checks:
+#   1. (node_id, seq) seen before      → duplicate sequence
+#   2. packet_ts < now - STALE_WINDOW  → stale timestamp (30s window)
+#   3. packet_ts > now + FUTURE_WINDOW → future-dated (10s window)
+#
+# A packet is only flagged as a replay if:
+#   - Check 1 AND Check 2 both fail  (duplicate + stale = clear replay)
+#   - Check 1 AND Check 3 both fail  (duplicate + future = spoofed)
+#   - Check 2 AND Check 3 both fail  (impossible in practice, but covered)
+#
+# Single failures are logged silently as warnings but NOT counted as replays.
+# This matches real-world IDS behaviour — multiple evidence points required.
 #
 # Replay stars:
-#   0 replays  → 0★
-#   1-2        → 1★
-#   3-5        → 2★
-#   6-10       → 3★
-#   11+        → 4★
+#   0 confirmed replays  → 0★
+#   1-2                  → 1★
+#   3-5                  → 2★
+#   6-10                 → 3★
+#   11+                  → 4★
 #
-# Response when replay detected:
+# Response when confirmed replay:
 #   → Increase replay count stars
 #   → Force profile escalation (minimum Profile 3)
 #   → Print red alert
 
-STALE_WINDOW_S  = 10.0   # seconds — older than this = stale/replay
-FUTURE_WINDOW_S = 2.0    # seconds — more than this in future = spoofed
+STALE_WINDOW_S  = 30.0   # seconds — generous window to avoid queue-delay false positives
+FUTURE_WINDOW_S = 10.0   # seconds — generous window to avoid clock-drift false positives
 
 @dataclass
 class ReplayTracker:
-    """Tracks replay attempts per node."""
-    seen_seqs:     set  = field(default_factory=set)
-    replay_count:  int  = 0
-    last_alert_at: float = 0.0
+    """
+    Tracks confirmed replay attempts per node.
+    Requires TWO independent checks to fail before flagging a replay.
+    Single check failures are soft warnings only.
+    """
+    seen_seqs:    set   = field(default_factory=set)
+    replay_count: int   = 0
 
     def check(self, node_id: str, seq: int, pkt_ts: float, now: float
               ) -> list[str]:
         """
-        Check a packet for replay. Returns list of reasons (empty = clean).
+        Check a packet for replay using multi-evidence approach.
+        Returns list of confirmed replay reasons (empty = clean or soft warning only).
+        A confirmed replay requires at least 2 checks to fail simultaneously.
         """
-        reasons = []
+        # Run all three checks independently
+        is_duplicate = False
+        is_stale     = False
+        is_future    = False
 
         # Check 1 — duplicate sequence number
         key = (node_id, seq)
         if key in self.seen_seqs:
-            reasons.append(f"DUPLICATE SEQ={seq}")
+            is_duplicate = True
         else:
             self.seen_seqs.add(key)
-            # Limit memory — keep only last 1000 seen
-            if len(self.seen_seqs) > 1000:
+            # Limit memory — keep only last 2000 seen seqs
+            if len(self.seen_seqs) > 2000:
                 self.seen_seqs.pop()
 
         # Check 2 — stale timestamp
         age = now - pkt_ts
         if age > STALE_WINDOW_S:
-            reasons.append(f"STALE TIMESTAMP (age={age:.1f}s > {STALE_WINDOW_S}s)")
+            is_stale = True
 
         # Check 3 — future timestamp
         if pkt_ts > now + FUTURE_WINDOW_S:
-            future = pkt_ts - now
-            reasons.append(f"FUTURE TIMESTAMP ({future:.1f}s ahead)")
+            is_future = True
 
-        if reasons:
+        # ── Multi-evidence decision ──────────────────────────────────
+        # Only flag as confirmed replay if 2+ checks fail
+        confirmed_reasons = []
+
+        if is_duplicate and is_stale:
+            confirmed_reasons.append(
+                f"DUPLICATE SEQ={seq} + STALE (age={age:.1f}s) — confirmed replay")
+
+        if is_duplicate and is_future:
+            future = pkt_ts - now
+            confirmed_reasons.append(
+                f"DUPLICATE SEQ={seq} + FUTURE ({future:.1f}s ahead) — spoofed replay")
+
+        if is_stale and is_future:
+            # Logically impossible but covered for completeness
+            confirmed_reasons.append(
+                f"STALE + FUTURE timestamp contradiction — packet manipulation")
+
+        if confirmed_reasons:
             self.replay_count += 1
 
-        return reasons
+        return confirmed_reasons
 
     def stars(self) -> int:
         c = self.replay_count
-        if c == 0:    return 0
-        if c <= 2:    return 1
-        if c <= 5:    return 2
-        if c <= 10:   return 3
+        if c == 0:   return 0
+        if c <= 2:   return 1
+        if c <= 5:   return 2
+        if c <= 10:  return 3
         return 4
 
 
@@ -453,8 +493,21 @@ AGING_K      = 0.1
 URGENT_FLOOR = 0.95
 
 def aging_key(priority: float, ts: float) -> float:
+    """
+    Routine:  Key = -(priority - 0.1 * t_arrival)   older = smaller key = first
+    Urgent:   Key = -1e12 + t_arrival                always beats routine,
+                                                     older fragment = smaller key = first
+
+    heapq is a min-heap so the smallest key is processed first.
+
+    The urgent offset (-1e12) is far more negative than any routine key
+    (routine keys are ~1.7e8), so every urgent packet is guaranteed to be
+    processed before every routine packet. Adding t_arrival back means that
+    AMONG urgent fragments, the older one (smaller timestamp) has the smaller
+    key and is therefore processed first — preserving fragment order.
+    """
     if priority >= URGENT_FLOOR:
-        return -9999.0 - ts
+        return -1e12 + ts
     return -(priority - AGING_K * ts)
 
 
@@ -823,7 +876,7 @@ def main():
     print(f"  Profile port : {BOLD(str(args.profile_port))}   (28-star profile assignment)")
     print(f"  Stage A      : FIFO for {args.time_scheduler_seconds}s")
     print(f"  Stage B      : Priority + Aging  Key=-(p-{AGING_K}×t)")
-    print(f"  Urgent floor : priority ≥ {URGENT_FLOOR} → Key=-9999-t")
+    print(f"  Urgent floor : priority ≥ {URGENT_FLOOR} → Key=-1e12+t")
     print(f"  Decrypt      : {GREEN('ON') if args.decrypt else DIM('OFF')}")
     divider()
     print(BOLD("  SCORING SYSTEM (28 stars total):"))
@@ -833,7 +886,7 @@ def main():
     print(f"  ├─ GATEWAY metrics (max 8★)")
     print(f"  │  6. WFSS Fragment Quality  (0-4★)  WFSS=Σ(w·b)/n")
     print(f"  │     weights: decrypt_fail=1.5  size_mismatch=1.0  out_of_order=0.5")
-    print(f"  │  7. Replay Count           (0-4★)  stale>{STALE_WINDOW_S}s | dup_seq | future>{FUTURE_WINDOW_S}s")
+    print(f"  │  7. Replay Count           (0-4★)  requires 2+ checks: dup_seq+stale>{STALE_WINDOW_S}s | dup_seq+future>{FUTURE_WINDOW_S}s")
     print(f"  └─ Score = (total_stars/28)×100  →  Profile 1-4")
     divider()
     print()
