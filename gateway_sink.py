@@ -659,7 +659,16 @@ def profile_server_thread(state: ClusterHeadState,
     to compute the final 28-star score and assign a profile.
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    srv.bind((bind_host, profile_port))
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    for attempt in range(10):
+        try:
+            srv.bind((bind_host, profile_port))
+            break
+        except OSError:
+            if attempt == 9:
+                print(RED(f"  [Profile Server] Could not bind port {profile_port}"))
+                return
+            time.sleep(1.0)
     srv.settimeout(0.5)
     print(GREEN(f"  [Profile Server] Listening on {bind_host}:{profile_port}"))
 
@@ -865,7 +874,19 @@ def main():
         USE_COLOUR = False
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind((args.bind_host, args.bind_port))
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Retry bind a few times in case the previous round's process is still
+    # releasing the port (avoids "Address already in use" during role rotation)
+    for attempt in range(10):
+        try:
+            sock.bind((args.bind_host, args.bind_port))
+            break
+        except OSError as e:
+            if attempt == 9:
+                print(f"[gateway] Could not bind {args.bind_host}:{args.bind_port} "
+                      f"after 10 attempts: {e}")
+                raise
+            time.sleep(1.0)
     sock.settimeout(0.05)
 
     state = ClusterHeadState(stage_a_seconds=args.time_scheduler_seconds)
