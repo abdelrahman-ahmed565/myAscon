@@ -335,20 +335,33 @@ def main():
                 "--gateway-port", str(args.data_port),
                 "--profile-port", str(args.profile_port),
                 "--length-mode", "auto",
+                "--count", "0",   # 0 = run continuously for the whole round so
+                                  # Stage B (after 20s) has traffic to schedule
             ]
 
         # Run the chosen role for round_time seconds
         try:
             proc = subprocess.Popen(cmd)
             time.sleep(args.round_time)
+            # Graceful shutdown first
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
         except FileNotFoundError:
             print(RED(f"  [LEACH] Script not found: {cmd[1]}"))
             time.sleep(2)
+
+        # Force-free the ports this role was using so the NEXT round can bind
+        # cleanly. This closes the window that caused "Address already in use".
+        os.system(f"sudo fuser -k {args.data_port}/udp {args.profile_port}/udp "
+                  f"2>/dev/null")
+        time.sleep(2)   # allow OS to fully release the ports before next round
 
         round_num += 1
         print()
